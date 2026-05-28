@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PaletteBuilder</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>PaletteBuilder</h1>
+          <p class="subtitle">Image colors to Toon Boom Harmony 25 palettes</p>
+        </div>
+        <div class="actions">
+          <button id="downloadTxtBtn" class="icon-button" type="button" disabled aria-label="Download Markdown report" title="Download Markdown report">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+            <span>MD</span>
+          </button>
+          <button id="downloadPltBtn" class="primary-button" type="button" disabled aria-label="Download Harmony PLT" title="Download Harmony PLT">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+            <span>PLT</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="drop-panel">
+          <label id="dropZone" class="drop-zone" for="imageInput">
+            <input id="imageInput" type="file" accept="image/*" />
+            <span class="drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14m7-7H5"/></svg>
+            </span>
+            <span class="drop-title">Drop image</span>
+            <span class="drop-meta">PNG, JPG, WebP, GIF</span>
+          </label>
+
+          <div class="preview-wrap">
+            <canvas id="previewCanvas" width="960" height="640" aria-label="Image preview"></canvas>
+            <div id="emptyPreview" class="empty-preview">No image loaded</div>
+          </div>
+        </div>
+
+        <aside class="control-panel" aria-label="Palette controls">
+          <div class="control-row">
+            <label for="paletteName">Palette</label>
+            <input id="paletteName" type="text" value="Generated_Palette" autocomplete="off" />
+          </div>
+
+          <label class="toggle-row">
+            <input id="ignoreTransparency" type="checkbox" checked />
+            <span>Skip transparent pixels</span>
+          </label>
+
+          <label class="toggle-row">
+            <input id="sortByCoverage" type="checkbox" checked />
+            <span>Sort by coverage</span>
+          </label>
+
+          <button id="analyzeBtn" class="wide-button" type="button" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5m0 14h16M8 16V9m4 7V6m4 10v-4"/></svg>
+            Analyze
+          </button>
+        </aside>
+      </section>
+
+      <section class="results-shell" aria-label="Generated palette">
+        <div class="results-head">
+          <div>
+            <h2>Swatches</h2>
+            <p id="statusLine">Load an image to begin.</p>
+          </div>
+          <button id="addSwatchBtn" class="icon-button" type="button" disabled aria-label="Add swatch" title="Add swatch">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m7-7H5"/></svg>
+            <span>Add</span>
+          </button>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Swatch</th>
+                <th>RGB</th>
+                <th>Color label</th>
+                <th>Associated object</th>
+                <th>Coverage</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="swatchTable">
+              <tr class="empty-row">
+                <td colspan="6">Generated colors will appear here.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="export-shell" aria-label="Export preview">
+        <div class="results-head">
+          <div>
+            <h2>Export Preview</h2>
+            <p id="exportStatusLine">Markdown output will appear after analysis.</p>
+          </div>
+          <div class="preview-tabs" role="tablist" aria-label="Preview format">
+            <button id="previewTxtBtn" class="tab-button is-active" type="button" role="tab" aria-selected="true">MD</button>
+            <button id="previewPltBtn" class="tab-button" type="button" role="tab" aria-selected="false">PLT</button>
+          </div>
+        </div>
+        <pre id="exportPreview" class="export-preview">Load an image to preview the exported data.</pre>
+      </section>
+    </main>
+
+    <template id="swatchRowTemplate">
+      <tr>
+        <td>
+          <div class="swatch-cell">
+            <input class="color-picker" type="color" aria-label="Swatch color" />
+            <input class="swatch-name" type="text" aria-label="Swatch name" />
+          </div>
+        </td>
+        <td><code class="rgb-value"></code></td>
+        <td><input class="color-name" type="text" aria-label="Color label" /></td>
+        <td><input class="object-name" type="text" aria-label="Associated object" /></td>
+        <td><span class="coverage"></span></td>
+        <td>
+          <button class="remove-button" type="button" aria-label="Remove swatch" title="Remove swatch">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          </button>
+        </td>
+      </tr>
+    </template>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
