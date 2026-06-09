@@ -69,12 +69,14 @@ const els = {
   downloadTxtBtn: document.querySelector("#downloadTxtBtn"),
   downloadPltBtn: document.querySelector("#downloadPltBtn"),
   downloadAcoBtn: document.querySelector("#downloadAcoBtn"),
+  downloadAseBtn: document.querySelector("#downloadAseBtn"),
   statusLine: document.querySelector("#statusLine"),
   exportStatusLine: document.querySelector("#exportStatusLine"),
   exportPreview: document.querySelector("#exportPreview"),
   previewTxtBtn: document.querySelector("#previewTxtBtn"),
   previewPltBtn: document.querySelector("#previewPltBtn"),
   previewAcoBtn: document.querySelector("#previewAcoBtn"),
+  previewAseBtn: document.querySelector("#previewAseBtn"),
   swatchTable: document.querySelector("#swatchTable"),
   rowTemplate: document.querySelector("#swatchRowTemplate")
 };
@@ -121,9 +123,11 @@ els.addSwatchBtn.addEventListener("click", addManualSwatch);
 els.downloadTxtBtn.addEventListener("click", downloadTxt);
 els.downloadPltBtn.addEventListener("click", downloadPlt);
 els.downloadAcoBtn.addEventListener("click", downloadAco);
+els.downloadAseBtn.addEventListener("click", downloadAse);
 els.previewTxtBtn.addEventListener("click", () => setExportPreviewMode("txt"));
 els.previewPltBtn.addEventListener("click", () => setExportPreviewMode("plt"));
 els.previewAcoBtn.addEventListener("click", () => setExportPreviewMode("aco"));
+els.previewAseBtn.addEventListener("click", () => setExportPreviewMode("ase"));
 
 if (new URLSearchParams(window.location.search).has("demo")) {
   loadDemoImage();
@@ -229,6 +233,7 @@ function setReady(isReady) {
   els.downloadTxtBtn.disabled = !isReady || state.swatches.length === 0;
   els.downloadPltBtn.disabled = !isReady || state.swatches.length === 0;
   els.downloadAcoBtn.disabled = !isReady || state.swatches.length === 0;
+  els.downloadAseBtn.disabled = !isReady || state.swatches.length === 0;
 }
 
 function analyzeCurrentImage() {
@@ -710,7 +715,8 @@ function setExportPreviewMode(mode) {
   const tabs = [
     [els.previewTxtBtn, "txt"],
     [els.previewPltBtn, "plt"],
-    [els.previewAcoBtn, "aco"]
+    [els.previewAcoBtn, "aco"],
+    [els.previewAseBtn, "ase"]
   ];
   for (const [button, value] of tabs) {
     const isActive = mode === value;
@@ -720,7 +726,7 @@ function setExportPreviewMode(mode) {
   refreshExportPreview();
 }
 
-const exportModeLabels = { txt: "Markdown", plt: "Harmony PLT", aco: "Photoshop ACO" };
+const exportModeLabels = { txt: "Markdown", plt: "Harmony PLT", aco: "Photoshop ACO", ase: "Adobe ASE" };
 
 function refreshExportPreview() {
   if (!state.swatches.length) {
@@ -734,6 +740,7 @@ function refreshExportPreview() {
   els.exportPreview.textContent =
     mode === "plt" ? buildHarmonyPalette()
     : mode === "aco" ? buildAcoPreview()
+    : mode === "ase" ? buildAsePreview()
     : buildMarkdownReport();
 }
 
@@ -804,6 +811,71 @@ function buildAcoPreview() {
     "Adobe Photoshop swatches (.aco)",
     `${state.swatches.length} colors · RGB · v1 + v2 (named) · ${bytes.length.toLocaleString()} bytes`,
     "Load in Photoshop: Swatches panel ▸ menu ▸ Load Swatches",
+    ""
+  ];
+  const nameWidth = Math.max(4, ...state.swatches.map((swatch) => acoSwatchName(swatch).length));
+  const rows = state.swatches.map((swatch, index) => {
+    const num = String(index + 1).padStart(3, " ");
+    const name = acoSwatchName(swatch).padEnd(nameWidth, " ");
+    const hex = rgbToHex(swatch.r, swatch.g, swatch.b).toUpperCase();
+    return `${num}  ${name}  ${hex}  ${formatRgb(swatch)}`;
+  });
+  return [...header, ...rows].join("\n");
+}
+
+function downloadAse() {
+  saveBinaryFile(`${sanitizeName(els.paletteName.value)}.ase`, buildAseBytes(), "application/octet-stream");
+}
+
+// Adobe Swatch Exchange (.ase) — the cross-app swatch format loaded by
+// Photoshop, Illustrator and InDesign. Layout: "ASEF" signature, version 1.0,
+// a 32-bit block count, then one color-entry block per swatch. Each block is
+// [type 0x0001][u32 length][u16 name length (incl. null)][UTF-16BE name + null]
+// ["RGB " model][3 × float32 BE in 0..1][u16 color type]. All big-endian.
+function buildAseBytes() {
+  const swatches = state.swatches;
+  const out = [];
+  const u16 = (arr, value) => arr.push((value >> 8) & 0xff, value & 0xff);
+  const u32 = (arr, value) => arr.push((value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff);
+  const f32 = (arr, value) => {
+    const view = new DataView(new ArrayBuffer(4));
+    view.setFloat32(0, value, false); // big-endian
+    arr.push(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+  };
+  const unit = (value) => Math.max(0, Math.min(255, Math.round(value))) / 255; // 0..255 -> 0..1
+
+  // Header: signature + version 1.0 + block count (one color entry per swatch).
+  out.push(0x41, 0x53, 0x45, 0x46); // "ASEF"
+  u16(out, 1);
+  u16(out, 0);
+  u32(out, swatches.length);
+
+  for (const swatch of swatches) {
+    const name = acoSwatchName(swatch);
+    const data = [];
+    u16(data, name.length + 1); // name length in UTF-16 units, including null terminator
+    for (let i = 0; i < name.length; i += 1) u16(data, name.charCodeAt(i)); // UTF-16BE
+    u16(data, 0); // null terminator
+    data.push(0x52, 0x47, 0x42, 0x20); // color model "RGB "
+    f32(data, unit(swatch.r));
+    f32(data, unit(swatch.g));
+    f32(data, unit(swatch.b));
+    u16(data, 2); // color type: 0=global, 1=spot, 2=normal/process
+
+    u16(out, 0x0001); // block type: color entry
+    u32(out, data.length); // block length
+    for (const byte of data) out.push(byte);
+  }
+
+  return new Uint8Array(out);
+}
+
+function buildAsePreview() {
+  const bytes = buildAseBytes();
+  const header = [
+    "Adobe Swatch Exchange (.ase)",
+    `${state.swatches.length} colors · RGB · ${bytes.length.toLocaleString()} bytes`,
+    "Works across Photoshop, Illustrator & InDesign: Swatches ▸ menu ▸ Open/Load Swatch Library",
     ""
   ];
   const nameWidth = Math.max(4, ...state.swatches.map((swatch) => acoSwatchName(swatch).length));
@@ -914,5 +986,7 @@ window.PaletteBuilder = {
   buildTxtReport,
   buildAcoBytes,
   buildAcoPreview,
+  buildAseBytes,
+  buildAsePreview,
   getSwatches: () => state.swatches.map((swatch) => ({ ...swatch }))
 };
