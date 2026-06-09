@@ -68,11 +68,13 @@ const els = {
   addSwatchBtn: document.querySelector("#addSwatchBtn"),
   downloadTxtBtn: document.querySelector("#downloadTxtBtn"),
   downloadPltBtn: document.querySelector("#downloadPltBtn"),
+  downloadAcoBtn: document.querySelector("#downloadAcoBtn"),
   statusLine: document.querySelector("#statusLine"),
   exportStatusLine: document.querySelector("#exportStatusLine"),
   exportPreview: document.querySelector("#exportPreview"),
   previewTxtBtn: document.querySelector("#previewTxtBtn"),
   previewPltBtn: document.querySelector("#previewPltBtn"),
+  previewAcoBtn: document.querySelector("#previewAcoBtn"),
   swatchTable: document.querySelector("#swatchTable"),
   rowTemplate: document.querySelector("#swatchRowTemplate")
 };
@@ -118,8 +120,10 @@ els.analyzeBtn.addEventListener("click", analyzeCurrentImage);
 els.addSwatchBtn.addEventListener("click", addManualSwatch);
 els.downloadTxtBtn.addEventListener("click", downloadTxt);
 els.downloadPltBtn.addEventListener("click", downloadPlt);
+els.downloadAcoBtn.addEventListener("click", downloadAco);
 els.previewTxtBtn.addEventListener("click", () => setExportPreviewMode("txt"));
 els.previewPltBtn.addEventListener("click", () => setExportPreviewMode("plt"));
+els.previewAcoBtn.addEventListener("click", () => setExportPreviewMode("aco"));
 
 if (new URLSearchParams(window.location.search).has("demo")) {
   loadDemoImage();
@@ -224,6 +228,7 @@ function setReady(isReady) {
   els.addSwatchBtn.disabled = !isReady;
   els.downloadTxtBtn.disabled = !isReady || state.swatches.length === 0;
   els.downloadPltBtn.disabled = !isReady || state.swatches.length === 0;
+  els.downloadAcoBtn.disabled = !isReady || state.swatches.length === 0;
 }
 
 function analyzeCurrentImage() {
@@ -702,12 +707,20 @@ function buildTxtReport() {
 
 function setExportPreviewMode(mode) {
   state.exportPreviewMode = mode;
-  els.previewTxtBtn.classList.toggle("is-active", mode === "txt");
-  els.previewPltBtn.classList.toggle("is-active", mode === "plt");
-  els.previewTxtBtn.setAttribute("aria-selected", String(mode === "txt"));
-  els.previewPltBtn.setAttribute("aria-selected", String(mode === "plt"));
+  const tabs = [
+    [els.previewTxtBtn, "txt"],
+    [els.previewPltBtn, "plt"],
+    [els.previewAcoBtn, "aco"]
+  ];
+  for (const [button, value] of tabs) {
+    const isActive = mode === value;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  }
   refreshExportPreview();
 }
+
+const exportModeLabels = { txt: "Markdown", plt: "Harmony PLT", aco: "Photoshop ACO" };
 
 function refreshExportPreview() {
   if (!state.swatches.length) {
@@ -716,9 +729,12 @@ function refreshExportPreview() {
     return;
   }
 
-  const isTxt = state.exportPreviewMode === "txt";
-  els.exportStatusLine.textContent = `${state.swatches.length} swatches ready for ${isTxt ? "Markdown" : "Harmony PLT"} export.`;
-  els.exportPreview.textContent = isTxt ? buildMarkdownReport() : buildHarmonyPalette();
+  const mode = state.exportPreviewMode;
+  els.exportStatusLine.textContent = `${state.swatches.length} swatches ready for ${exportModeLabels[mode] || "Markdown"} export.`;
+  els.exportPreview.textContent =
+    mode === "plt" ? buildHarmonyPalette()
+    : mode === "aco" ? buildAcoPreview()
+    : buildMarkdownReport();
 }
 
 function downloadPlt() {
@@ -736,13 +752,84 @@ function buildHarmonyPalette() {
   return `${lines.join("\n")}\n`;
 }
 
+function downloadAco() {
+  saveBinaryFile(`${sanitizeName(els.paletteName.value)}.aco`, buildAcoBytes(), "application/octet-stream");
+}
+
+// Adobe Color Swatches (.aco) — the file Photoshop's Swatches panel loads via
+// "Load Swatches". Photoshop writes a version 1 block (raw colors) immediately
+// followed by a version 2 block (same colors plus UTF-16 names) so that both
+// legacy and named-swatch readers work; we mirror that layout.
+function buildAcoBytes() {
+  const swatches = state.swatches;
+  const bytes = [];
+  const push16 = (value) => bytes.push((value >> 8) & 0xff, value & 0xff);
+  const push32 = (value) => bytes.push((value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff);
+  const channel16 = (value) => Math.max(0, Math.min(255, Math.round(value))) * 257; // 0..255 -> 0..65535
+
+  const writeColor = (swatch) => {
+    push16(0); // color space: 0 = RGB
+    push16(channel16(swatch.r));
+    push16(channel16(swatch.g));
+    push16(channel16(swatch.b));
+    push16(0); // 4th component unused for RGB
+  };
+
+  // Version 1 block.
+  push16(1);
+  push16(swatches.length);
+  for (const swatch of swatches) writeColor(swatch);
+
+  // Version 2 block (adds names).
+  push16(2);
+  push16(swatches.length);
+  for (const swatch of swatches) {
+    writeColor(swatch);
+    const name = acoSwatchName(swatch);
+    push32(name.length + 1); // character count, including the null terminator
+    for (let i = 0; i < name.length; i += 1) push16(name.charCodeAt(i)); // UTF-16BE
+    push16(0); // null terminator
+  }
+
+  return new Uint8Array(bytes);
+}
+
+function acoSwatchName(swatch) {
+  return (swatch.colorName || swatch.swatchName || swatch.objectName || "Color").trim() || "Color";
+}
+
+function buildAcoPreview() {
+  const bytes = buildAcoBytes();
+  const header = [
+    "Adobe Photoshop swatches (.aco)",
+    `${state.swatches.length} colors · RGB · v1 + v2 (named) · ${bytes.length.toLocaleString()} bytes`,
+    "Load in Photoshop: Swatches panel ▸ menu ▸ Load Swatches",
+    ""
+  ];
+  const nameWidth = Math.max(4, ...state.swatches.map((swatch) => acoSwatchName(swatch).length));
+  const rows = state.swatches.map((swatch, index) => {
+    const num = String(index + 1).padStart(3, " ");
+    const name = acoSwatchName(swatch).padEnd(nameWidth, " ");
+    const hex = rgbToHex(swatch.r, swatch.g, swatch.b).toUpperCase();
+    return `${num}  ${name}  ${hex}  ${formatRgb(swatch)}`;
+  });
+  return [...header, ...rows].join("\n");
+}
+
 function saveTextFile(fileName, text) {
   const type = fileName.endsWith(".md") ? "text/markdown;charset=utf-8" : "text/plain;charset=utf-8";
-  const blob = new Blob([text], { type });
+  saveBlob(fileName || "palette.md", new Blob([text], { type }));
+}
+
+function saveBinaryFile(fileName, bytes, type = "application/octet-stream") {
+  saveBlob(fileName || "palette.aco", new Blob([bytes], { type }));
+}
+
+function saveBlob(fileName, blob) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = fileName || "palette.md";
+  link.download = fileName;
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -825,5 +912,7 @@ window.PaletteBuilder = {
   buildHarmonyPalette,
   buildMarkdownReport,
   buildTxtReport,
+  buildAcoBytes,
+  buildAcoPreview,
   getSwatches: () => state.swatches.map((swatch) => ({ ...swatch }))
 };

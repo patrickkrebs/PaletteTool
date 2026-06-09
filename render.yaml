@@ -2,5 +2,5 @@ services:
   - type: web
     name: palettebuilder
     runtime: static
-    buildCommand: "rm -rf dist && mkdir -p dist && cp -v index.html styles.css app.js dist/ && cp -v styles.css dist/app.css && ls -la dist"
+    buildCommand: "rm -rf dist && mkdir -p dist && cp -v index.html styles.css app.js dist/ && ls -la dist"
     staticPublishPath: ./dist

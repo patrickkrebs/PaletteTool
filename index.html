@@ -4,19 +4,23 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PaletteBuilder</title>
-    <link rel="stylesheet" href="./app.css" />
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
         <div>
           <h1>PaletteBuilder</h1>
-          <p class="subtitle">Image colors to Toon Boom Harmony 25 palettes</p>
+          <p class="subtitle">Image colors to Toon Boom Harmony &amp; Photoshop palettes</p>
         </div>
         <div class="actions">
           <button id="downloadTxtBtn" class="icon-button" type="button" disabled aria-label="Download Markdown report" title="Download Markdown report">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
             <span>MD</span>
+          </button>
+          <button id="downloadAcoBtn" class="icon-button" type="button" disabled aria-label="Download Photoshop ACO swatches" title="Download Photoshop ACO swatches">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+            <span>ACO</span>
           </button>
           <button id="downloadPltBtn" class="primary-button" type="button" disabled aria-label="Download Harmony PLT" title="Download Harmony PLT">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
@@ -107,6 +111,7 @@
           <div class="preview-tabs" role="tablist" aria-label="Preview format">
             <button id="previewTxtBtn" class="tab-button is-active" type="button" role="tab" aria-selected="true">MD</button>
             <button id="previewPltBtn" class="tab-button" type="button" role="tab" aria-selected="false">PLT</button>
+            <button id="previewAcoBtn" class="tab-button" type="button" role="tab" aria-selected="false">ACO</button>
           </div>
         </div>
         <pre id="exportPreview" class="export-preview">Load an image to preview the exported data.</pre>

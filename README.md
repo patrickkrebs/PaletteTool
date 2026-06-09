@@ -1,6 +1,6 @@
 # PaletteBuilder
 
-A standalone browser app that turns a dragged image into an editable practical-color table, an aligned Markdown report, and a Toon Boom Harmony 25 `.plt` palette.
+A standalone browser app that turns a dragged image into an editable practical-color table, an aligned Markdown report, a Toon Boom Harmony 25 `.plt` palette, and a Photoshop `.aco` swatch set.
 
 Open `index.html` directly, or serve the folder locally:
 
@@ -14,6 +14,8 @@ The `.plt` exporter matches the supplied Harmony sample:
 ToonBoomAnimationInc PaletteFile 2
 Solid    swatch_name                0x0000000000000000 255 255 255 255
 ```
+
+The `.aco` exporter writes an Adobe Color Swatches file — load it in Photoshop via the Swatches panel menu → **Load Swatches**. Each swatch is written as RGB with its color label as the name, in both the version 1 (legacy) and version 2 (named) blocks Photoshop expects.
 
 The app automatically determines practical palette colors from the image, grouping anti-aliased edge pixels into representative color families instead of dumping every RGB variant. Color labels and associated objects are generated from a curated color vocabulary plus image-position heuristics, and can be edited before export.
 
