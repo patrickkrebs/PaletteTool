@@ -3,7 +3,6 @@
 
 const els = {
   imageInput: document.querySelector("#imageInput"),
-  dropZone: document.querySelector("#dropZone"),
   previewCanvas: document.querySelector("#previewCanvas"),
   previewWrap: document.querySelector(".preview-wrap"),
   overlayLayer: document.querySelector("#overlayLayer"),
@@ -13,6 +12,8 @@ const els = {
   sortByCoverage: document.querySelector("#sortByCoverage"),
   showCallouts: document.querySelector("#showCallouts"),
   pickMode: document.querySelector("#pickMode"),
+  showCmyk: document.querySelector("#showCmyk"),
+  showLab: document.querySelector("#showLab"),
   clearSwatchesBtn: document.querySelector("#clearSwatchesBtn"),
   colorDetail: document.querySelector("#colorDetail"),
   colorDetailValue: document.querySelector("#colorDetailValue"),
@@ -61,9 +62,12 @@ const state = {
   lastDetections: null,
   analyzeToken: 0,
   previewRect: null,
+  view: null,
   sampleCanvas: null,
   showCallouts: true,
   pickMode: false,
+  showCmyk: false,
+  showLab: false,
   aiEnabled: false,
   aiProvider: "anthropic",
   aiKeys: { anthropic: "", openai: "" },
@@ -171,23 +175,29 @@ els.imageInput.addEventListener("change", (event) => {
   if (file) loadImageFile(file);
 });
 
+// Click the empty-preview prompt to browse for a file.
+els.emptyPreview.addEventListener("click", () => els.imageInput.click());
+
+// Drag an image straight onto the preview area (works empty or to replace).
 ["dragenter", "dragover"].forEach((eventName) => {
-  els.dropZone.addEventListener(eventName, (event) => {
+  els.previewWrap.addEventListener(eventName, (event) => {
+    if (!event.dataTransfer || !Array.from(event.dataTransfer.types || []).includes("Files")) return;
     event.preventDefault();
-    els.dropZone.classList.add("is-dragging");
+    els.previewWrap.classList.add("is-dragging");
   });
 });
 
-["dragleave", "drop"].forEach((eventName) => {
-  els.dropZone.addEventListener(eventName, (event) => {
+["dragleave", "dragend", "drop"].forEach((eventName) => {
+  els.previewWrap.addEventListener(eventName, (event) => {
     event.preventDefault();
-    els.dropZone.classList.remove("is-dragging");
+    els.previewWrap.classList.remove("is-dragging");
   });
 });
 
-els.dropZone.addEventListener("drop", (event) => {
+els.previewWrap.addEventListener("drop", (event) => {
   const [file] = event.dataTransfer.files;
   if (file && file.type.startsWith("image/")) loadImageFile(file);
+  else if (file) logLine(`Ignored dropped file "${file.name}" — not an image.`, "warn");
 });
 
 els.analyzeBtn.addEventListener("click", analyzeCurrentImage);
@@ -237,9 +247,70 @@ if (els.clearSwatchesBtn) {
   els.clearSwatchesBtn.addEventListener("click", clearSwatches);
 }
 
+if (els.showCmyk) {
+  els.showCmyk.addEventListener("change", () => {
+    state.showCmyk = els.showCmyk.checked;
+    renderSwatches();
+  });
+}
+if (els.showLab) {
+  els.showLab.addEventListener("change", () => {
+    state.showLab = els.showLab.checked;
+    renderSwatches();
+  });
+}
+
+// Pan with the middle mouse button, or Shift + left drag. A capture-phase
+// listener on the preview wrapper preempts the pick / dot / grip handlers for
+// these gestures.
+function canvasDisplayScale() {
+  const canvas = els.previewCanvas;
+  return Math.min(canvas.clientWidth / canvas.width, canvas.clientHeight / canvas.height) || 1;
+}
+
+els.previewWrap.addEventListener(
+  "pointerdown",
+  (event) => {
+    const isPan = event.button === 1 || (event.button === 0 && event.shiftKey);
+    if (!isPan || !state.image || !state.view) return;
+    event.preventDefault();
+    event.stopPropagation(); // beat the pick / dot-drag / grip handlers
+
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startOffsetX = state.view.offsetX;
+    const startOffsetY = state.view.offsetY;
+    const displayScale = canvasDisplayScale();
+    const drawW = state.previewRect.width;
+    const drawH = state.previewRect.height;
+    const canvas = els.previewCanvas;
+    els.previewWrap.classList.add("is-panning");
+    els.previewWrap.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const dx = (moveEvent.clientX - startX) / displayScale;
+      const dy = (moveEvent.clientY - startY) / displayScale;
+      // Keep at least 60px of the image on the canvas so it can't be lost.
+      state.view.offsetX = Math.min(canvas.width - 60, Math.max(60 - drawW, startOffsetX + dx));
+      state.view.offsetY = Math.min(canvas.height - 60, Math.max(60 - drawH, startOffsetY + dy));
+      redrawPreview();
+    };
+    const onUp = () => {
+      els.previewWrap.releasePointerCapture(event.pointerId);
+      els.previewWrap.classList.remove("is-panning");
+      els.previewWrap.removeEventListener("pointermove", onMove);
+      els.previewWrap.removeEventListener("pointerup", onUp);
+    };
+    els.previewWrap.addEventListener("pointermove", onMove);
+    els.previewWrap.addEventListener("pointerup", onUp);
+  },
+  true
+);
+
 // In pick mode, press on the image to open a magnifier loupe (same zoom as the
 // dot drag), aim while holding, and release to drop a labelled swatch there.
 els.previewCanvas.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0 || event.shiftKey) return; // left-only; Shift+left pans
   if (!state.pickMode || !state.image || !state.previewRect) return;
   event.preventDefault();
   const layerRect = els.overlayLayer.getBoundingClientRect();
@@ -267,6 +338,35 @@ els.previewCanvas.addEventListener("pointerdown", (event) => {
   };
   els.previewCanvas.addEventListener("pointermove", onMove);
   els.previewCanvas.addEventListener("pointerup", onUp);
+});
+
+// Zoom with the mouse wheel (middle-button scroll), anchored under the cursor.
+els.previewWrap.addEventListener(
+  "wheel",
+  (event) => {
+    if (!state.image) return;
+    event.preventDefault();
+    const focal = clientToCanvas(event.clientX, event.clientY);
+    zoomPreview(event.deltaY < 0 ? 1.12 : 1 / 1.12, focal.fx, focal.fy);
+  },
+  { passive: false }
+);
+
+// Zoom with Shift +/- (and reset with Shift+0), unless typing in a field.
+window.addEventListener("keydown", (event) => {
+  const tag = (event.target && event.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (!state.image) return;
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    zoomPreview(1.18);
+  } else if (event.key === "-" || event.key === "_") {
+    event.preventDefault();
+    zoomPreview(1 / 1.18);
+  } else if (event.key === "0" && (event.shiftKey || event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    resetZoom();
+  }
 });
 
 let reExtractTimer = null;
@@ -429,23 +529,84 @@ function loadImage(url) {
   });
 }
 
+const PREVIEW_BG = "#2e2e2e"; // solid 18% (lightness) gray backdrop
+const PREVIEW_MARGIN = 40; // buffer (canvas px) around the image at the fitted zoom
+
+// The fitted view: image scaled to sit inside the canvas minus the margin, centered.
+function fitView(image) {
+  const canvas = els.previewCanvas;
+  const iw = image.naturalWidth || image.width;
+  const ih = image.naturalHeight || image.height;
+  const baseScale = Math.min((canvas.width - 2 * PREVIEW_MARGIN) / iw, (canvas.height - 2 * PREVIEW_MARGIN) / ih);
+  const drawW = iw * baseScale;
+  const drawH = ih * baseScale;
+  return {
+    forImage: image,
+    baseScale,
+    scale: baseScale,
+    offsetX: (canvas.width - drawW) / 2,
+    offsetY: (canvas.height - drawH) / 2
+  };
+}
+
 function drawPreview(image) {
   const canvas = els.previewCanvas;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const ratio = Math.min(canvas.width / image.width, canvas.height / image.height);
-  const width = Math.round(image.width * ratio);
-  const height = Math.round(image.height * ratio);
-  const x = Math.round((canvas.width - width) / 2);
-  const y = Math.round((canvas.height - height) / 2);
+  if (!state.view || state.view.forImage !== image) state.view = fitView(image);
+  const view = state.view;
+  const iw = image.naturalWidth || image.width;
+  const ih = image.naturalHeight || image.height;
+  const width = iw * view.scale;
+  const height = ih * view.scale;
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  // Solid gray fills the whole canvas; the image sits within it with a buffer.
+  ctx.fillStyle = PREVIEW_BG;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(image, x, y, width, height);
+  ctx.drawImage(image, view.offsetX, view.offsetY, width, height);
 
-  // Remember where the image content sits inside the canvas bitmap so callout
-  // markers can be mapped from image-normalized coordinates to screen pixels.
-  state.previewRect = { x, y, width, height };
+  // Remember where the image content sits inside the canvas bitmap so callouts
+  // map from image-normalized coordinates to screen pixels (zoom/margin aware).
+  state.previewRect = { x: view.offsetX, y: view.offsetY, width, height };
   renderOverlay();
+}
+
+function redrawPreview() {
+  if (state.image) drawPreview(state.image);
+}
+
+// Map a client (mouse) point to canvas-internal coordinates, accounting for the
+// canvas being CSS-scaled with object-fit: contain.
+function clientToCanvas(clientX, clientY) {
+  const canvas = els.previewCanvas;
+  const layerRect = els.overlayLayer.getBoundingClientRect();
+  const scale = Math.min(canvas.clientWidth / canvas.width, canvas.clientHeight / canvas.height);
+  const offsetX = canvas.offsetLeft + (canvas.clientWidth - canvas.width * scale) / 2;
+  const offsetY = canvas.offsetTop + (canvas.clientHeight - canvas.height * scale) / 2;
+  return { fx: (clientX - layerRect.left - offsetX) / scale, fy: (clientY - layerRect.top - offsetY) / scale };
+}
+
+// Zoom by `factor` keeping the canvas point (fx, fy) fixed under the cursor.
+function zoomPreview(factor, fx, fy) {
+  if (!state.image || !state.view) return;
+  const canvas = els.previewCanvas;
+  if (fx === undefined) fx = canvas.width / 2;
+  if (fy === undefined) fy = canvas.height / 2;
+  const view = state.view;
+  const imageX = (fx - view.offsetX) / view.scale;
+  const imageY = (fy - view.offsetY) / view.scale;
+  const newScale = Math.min(view.baseScale * 8, Math.max(view.baseScale * 0.5, view.scale * factor));
+  view.scale = newScale;
+  view.offsetX = fx - imageX * newScale;
+  view.offsetY = fy - imageY * newScale;
+  redrawPreview();
+}
+
+function resetZoom() {
+  if (state.image) {
+    state.view = fitView(state.image);
+    redrawPreview();
+  }
 }
 
 function loadDemoImage() {
@@ -1488,7 +1649,7 @@ function renderSwatches() {
     swatchName.dataset.swatchId = swatch.id;
     colorName.value = swatch.colorName;
     objectName.value = swatch.objectName;
-    rgbValue.textContent = formatRgb(swatch);
+    rgbValue.textContent = formatColorValues(swatch);
     coverage.textContent = `${(swatch.coverage * 100).toFixed(1)}%`;
 
     colorPicker.addEventListener("input", () => {
@@ -1498,7 +1659,7 @@ function renderSwatches() {
       // user/detector assigned, since object identity doesn't change with a hue tweak.
       swatch.colorName = makeReadableColorLabel(rgb.r, rgb.g, rgb.b);
       colorName.value = swatch.colorName;
-      rgbValue.textContent = formatRgb(swatch);
+      rgbValue.textContent = formatColorValues(swatch);
       refreshExportPreview();
     });
     // Rescan percentages once the new color is committed (not on every drag frame).
@@ -2001,6 +2162,8 @@ function projectToData() {
       ignoreTransparency: els.ignoreTransparency.checked,
       sortByCoverage: els.sortByCoverage.checked,
       showCallouts: state.showCallouts,
+      showCmyk: state.showCmyk,
+      showLab: state.showLab,
       colorDetail: els.colorDetail ? Number(els.colorDetail.value) : 55,
       maxColors: getMaxColors(),
       aiProvider: state.aiProvider,
@@ -2074,6 +2237,14 @@ async function loadProject(data) {
     state.showCallouts = settings.showCallouts;
     if (els.showCallouts) els.showCallouts.checked = settings.showCallouts;
   }
+  if (typeof settings.showCmyk === "boolean") {
+    state.showCmyk = settings.showCmyk;
+    if (els.showCmyk) els.showCmyk.checked = settings.showCmyk;
+  }
+  if (typeof settings.showLab === "boolean") {
+    state.showLab = settings.showLab;
+    if (els.showLab) els.showLab.checked = settings.showLab;
+  }
   if (Number.isFinite(settings.colorDetail) && els.colorDetail) {
     els.colorDetail.value = settings.colorDetail;
     updateColorDetailLabel();
@@ -2121,12 +2292,18 @@ function clampByte(value) {
 }
 
 function buildMarkdownReport() {
-  const rows = state.swatches.map((swatch) => [
-    formatRgb(swatch),
-    swatch.colorName,
-    swatch.objectName,
-    sanitizeName(swatch.swatchName)
-  ]);
+  const headers = ["RGB"];
+  if (state.showCmyk) headers.push("CMYK");
+  if (state.showLab) headers.push("Lab");
+  headers.push("Color label", "Associated object", "Harmony swatch");
+
+  const rows = state.swatches.map((swatch) => {
+    const row = [formatRgb(swatch)];
+    if (state.showCmyk) row.push(formatCmyk(swatch));
+    if (state.showLab) row.push(formatLab(swatch));
+    row.push(swatch.colorName, swatch.objectName, sanitizeName(swatch.swatchName));
+    return row;
+  });
 
   return [
     `# ${els.paletteName.value || "Generated_Palette"} Palette`,
@@ -2135,7 +2312,7 @@ function buildMarkdownReport() {
     `- Generated: ${(state.generatedAt || new Date()).toLocaleString()}`,
     `- Swatches: ${state.swatches.length}`,
     "",
-    buildAlignedMarkdownTable(["RGB", "Color label", "Associated object", "Harmony swatch"], rows)
+    buildAlignedMarkdownTable(headers, rows)
   ].join("\n");
 }
 
@@ -2380,6 +2557,56 @@ function padColor(value) {
 
 function formatRgb({ r, g, b }) {
   return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
+}
+
+// RGB -> CMYK (simple, ink-percentage approximation).
+function rgbToCmyk(r, g, b) {
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const k = 1 - Math.max(rn, gn, bn);
+  if (k >= 1) return { c: 0, m: 0, y: 0, k: 100 };
+  const c = (1 - rn - k) / (1 - k);
+  const m = (1 - gn - k) / (1 - k);
+  const y = (1 - bn - k) / (1 - k);
+  return { c: Math.round(c * 100), m: Math.round(m * 100), y: Math.round(y * 100), k: Math.round(k * 100) };
+}
+
+// RGB -> CIELAB (sRGB, D65 white point).
+function rgbToLab(r, g, b) {
+  const toLinear = (value) => {
+    const c = value / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const rl = toLinear(r);
+  const gl = toLinear(g);
+  const bl = toLinear(b);
+  const x = (rl * 0.4124 + gl * 0.3576 + bl * 0.1805) / 0.95047;
+  const y = rl * 0.2126 + gl * 0.7152 + bl * 0.0722;
+  const z = (rl * 0.0193 + gl * 0.1192 + bl * 0.9505) / 1.08883;
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(x);
+  const fy = f(y);
+  const fz = f(z);
+  return { L: Math.round(116 * fy - 16), a: Math.round(500 * (fx - fy)), b: Math.round(200 * (fy - fz)) };
+}
+
+function formatCmyk({ r, g, b }) {
+  const { c, m, y, k } = rgbToCmyk(r, g, b);
+  return `cmyk(${c}%, ${m}%, ${y}%, ${k}%)`;
+}
+
+function formatLab({ r, g, b }) {
+  const { L, a, b: bb } = rgbToLab(r, g, b);
+  return `lab(${L}, ${a}, ${bb})`;
+}
+
+// rgb plus any enabled optional color spaces, one per line.
+function formatColorValues(swatch) {
+  const lines = [formatRgb(swatch)];
+  if (state.showCmyk) lines.push(formatCmyk(swatch));
+  if (state.showLab) lines.push(formatLab(swatch));
+  return lines.join("\n");
 }
 
 function buildAlignedMarkdownTable(headers, rows) {

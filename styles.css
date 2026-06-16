@@ -153,7 +153,7 @@ svg {
 
 .drop-panel {
   display: grid;
-  grid-template-columns: minmax(220px, 0.28fr) minmax(320px, 1fr);
+  grid-template-columns: 1fr;
   gap: 0;
   min-height: 360px;
   background: var(--panel);
@@ -221,18 +221,8 @@ svg {
 .preview-wrap {
   position: relative;
   min-height: 360px;
-  background:
-    linear-gradient(45deg, #dfe5e8 25%, transparent 25%),
-    linear-gradient(-45deg, #dfe5e8 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #dfe5e8 75%),
-    linear-gradient(-45deg, transparent 75%, #dfe5e8 75%),
-    #eef2f4;
-  background-position:
-    0 0,
-    0 12px,
-    12px -12px,
-    -12px 0;
-  background-size: 24px 24px;
+  /* Solid 18% gray backdrop behind the imported image. */
+  background: #2e2e2e;
 }
 
 #previewCanvas {
@@ -246,11 +236,37 @@ svg {
 .empty-preview {
   position: absolute;
   inset: 0;
-  display: grid;
-  place-items: center;
-  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  color: #cdd6e0;
+  font-family: inherit;
   font-size: 0.95rem;
-  background: rgba(238, 242, 244, 0.72);
+  text-align: center;
+  background: #2e2e2e;
+  cursor: pointer;
+  transition: background 150ms ease, outline-color 150ms ease;
+}
+
+.empty-preview:hover {
+  background: #343b44;
+}
+
+.preview-wrap.is-dragging {
+  outline: 3px solid rgba(0, 124, 137, 0.55);
+  outline-offset: -6px;
+}
+
+.preview-wrap.is-dragging .empty-preview {
+  background: #1f3a3d;
+}
+
+.empty-preview .drop-meta {
+  color: #9aa4ad;
 }
 
 .overlay-layer {
@@ -455,6 +471,11 @@ svg {
 
 .preview-wrap.is-picking {
   cursor: crosshair;
+}
+
+.preview-wrap.is-panning,
+.preview-wrap.is-panning #previewCanvas {
+  cursor: grabbing;
 }
 
 .preview-wrap.is-picking #previewCanvas {
@@ -820,7 +841,9 @@ th {
 }
 
 .rgb-value {
-  white-space: nowrap;
+  display: inline-block;
+  white-space: pre-line;
+  line-height: 1.5;
   color: #30363b;
   background: #f0f3f5;
   border: 1px solid #e2e7ea;
