@@ -253,6 +253,230 @@ svg {
   background: rgba(238, 242, 244, 0.72);
 }
 
+.overlay-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.overlay-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.overlay-lines line {
+  stroke: #11161d;
+  stroke-width: 2;
+  opacity: 0.9;
+}
+
+.overlay-dot {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  margin: -6.5px 0 0 -6.5px;
+  border-radius: 50%;
+  border: 2px solid #ffffff;
+  box-shadow: 0 0 0 1.5px #11161d, 0 1px 3px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+}
+
+.overlay-dot:hover {
+  box-shadow: 0 0 0 2px var(--accent, #137a7f), 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+.overlay-dot.is-dragging {
+  cursor: grabbing;
+}
+
+.overlay-loupe {
+  position: absolute;
+  z-index: 6;
+  width: 124px;
+  pointer-events: none;
+  border: 2px solid #11161d;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #11161d;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+
+.overlay-loupe canvas {
+  display: block;
+  width: 120px;
+  height: 120px;
+  margin: 2px;
+  image-rendering: pixelated;
+  border-radius: 4px;
+}
+
+.overlay-loupe .loupe-readout {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 4px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+}
+
+.overlay-loupe .loupe-chip {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  flex: none;
+}
+
+.overlay-callout {
+  position: absolute;
+  width: 104px;
+  pointer-events: none;
+}
+
+.overlay-grip {
+  position: absolute;
+  left: -15px;
+  top: 0;
+  width: 14px;
+  height: 21px;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  line-height: 1;
+  color: #11161d;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(17, 22, 29, 0.5);
+  border-radius: 4px;
+  cursor: grab;
+  pointer-events: auto;
+  user-select: none;
+  touch-action: none;
+}
+
+.overlay-callout.is-dragging .overlay-grip {
+  cursor: grabbing;
+  background: rgba(255, 255, 255, 0.95);
+}
+
+/* Scoped + element-qualified so it beats the global input[type="text"] rule
+   (which would otherwise force width:100% and min-height:38px). */
+.overlay-layer input.overlay-label {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 0;
+  height: 21px;
+  padding: 1px 5px;
+  font-size: 11px;
+  line-height: 1.4;
+  font-family: inherit;
+  color: #10151c;
+  background: rgba(255, 255, 255, 0.32);
+  border: 1px solid rgba(17, 22, 29, 0.55);
+  border-radius: 5px;
+  box-shadow: none;
+  /* Keep text legible over busy artwork while the fill stays see-through. */
+  text-shadow: 0 0 2px #fff, 0 0 2px #fff, 0 0 3px #fff;
+  pointer-events: auto;
+  transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+
+/* Solidify on hover/focus so editing is comfortable. */
+.overlay-layer input.overlay-label:hover,
+.overlay-layer input.overlay-label:focus {
+  background: rgba(255, 255, 255, 0.97);
+  text-shadow: none;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.3);
+  outline: 2px solid var(--accent, #137a7f);
+  outline-offset: 1px;
+}
+
+.range-value {
+  float: right;
+  font-weight: 600;
+  color: var(--accent, #137a7f);
+}
+
+#colorDetail {
+  width: 100%;
+  min-height: 0;
+  accent-color: var(--accent, #137a7f);
+}
+
+.range-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.72rem;
+  color: var(--muted, #6b7480);
+}
+
+.control-divider {
+  height: 1px;
+  margin: 16px 0;
+  background: var(--line);
+}
+
+.results-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.preview-wrap.is-picking {
+  cursor: crosshair;
+}
+
+.preview-wrap.is-picking #previewCanvas {
+  cursor: crosshair;
+}
+
+.ai-fields {
+  margin-top: 8px;
+}
+
+.ai-fields .control-row {
+  margin-bottom: 10px;
+}
+
+.ai-fields select {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink, #1f2a37);
+  font: inherit;
+}
+
+.ai-note {
+  margin: 8px 0 0;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  color: var(--muted, #6b7480);
+}
+
+.wide-button.subtle {
+  background: #eef2f4;
+  color: var(--ink, #1f2a37);
+  border: 1px solid var(--line);
+}
+
+.wide-button.subtle:hover:not(:disabled) {
+  background: #e3e9ec;
+}
+
+.wide-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .control-panel {
   padding: 18px;
   background: #fbfcfd;
@@ -272,7 +496,8 @@ label {
 }
 
 input[type="text"],
-input[type="number"] {
+input[type="number"],
+input[type="password"] {
   width: 100%;
   min-height: 38px;
   border: 1px solid var(--line);

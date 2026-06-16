@@ -14,6 +14,15 @@
           <p class="subtitle">Image colors to Toon Boom Harmony &amp; Adobe palettes</p>
         </div>
         <div class="actions">
+          <input id="projectInput" type="file" accept="application/json,.json" hidden />
+          <button id="loadProjectBtn" class="icon-button" type="button" aria-label="Load project" title="Load project (.json)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21V9m0 12-4-4m4 4 4-4M5 3h14"/></svg>
+            <span>Load</span>
+          </button>
+          <button id="saveProjectBtn" class="icon-button" type="button" disabled aria-label="Save project" title="Save project (.json)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2zM7 3v6h8M7 21v-6h10v6"/></svg>
+            <span>Save</span>
+          </button>
           <button id="downloadTxtBtn" class="icon-button" type="button" disabled aria-label="Download Markdown report" title="Download Markdown report">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
             <span>MD</span>
@@ -46,6 +55,7 @@
 
           <div class="preview-wrap">
             <canvas id="previewCanvas" width="960" height="640" aria-label="Image preview"></canvas>
+            <div id="overlayLayer" class="overlay-layer" aria-label="Color callouts"></div>
             <div id="emptyPreview" class="empty-preview">No image loaded</div>
           </div>
         </div>
@@ -66,6 +76,55 @@
             <span>Sort by coverage</span>
           </label>
 
+          <label class="toggle-row">
+            <input id="showCallouts" type="checkbox" checked />
+            <span>Show callouts on image</span>
+          </label>
+
+          <label class="toggle-row">
+            <input id="pickMode" type="checkbox" />
+            <span>Click to pick colors</span>
+          </label>
+
+          <div class="control-row">
+            <label for="colorDetail">Color detail<span id="colorDetailValue" class="range-value">Balanced</span></label>
+            <input id="colorDetail" type="range" min="0" max="100" value="55" step="5" />
+            <span class="range-hint">How aggressively similar colors merge</span>
+          </div>
+
+          <div class="control-row">
+            <label for="maxColors">Max colors</label>
+            <input id="maxColors" type="number" min="1" max="128" placeholder="Auto" autocomplete="off" />
+            <span class="range-hint">Cap the palette size (blank = automatic)</span>
+          </div>
+
+          <div class="control-divider"></div>
+
+          <label class="toggle-row">
+            <input id="aiToggle" type="checkbox" />
+            <span>AI object labeling</span>
+          </label>
+
+          <div id="aiFields" class="ai-fields" hidden>
+            <div class="control-row">
+              <label for="aiProvider">Provider</label>
+              <select id="aiProvider">
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="openai">OpenAI</option>
+              </select>
+            </div>
+            <div class="control-row">
+              <label id="aiKeyLabel" for="aiKey">Anthropic API key</label>
+              <input id="aiKey" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="control-row">
+              <label for="aiModel">Model</label>
+              <select id="aiModel"></select>
+            </div>
+            <button id="aiLabelBtn" class="wide-button subtle" type="button" disabled>Label with AI</button>
+            <p id="aiNote" class="ai-note">Labels the extracted colors by reading markers placed on the image. Sends the image to Anthropic using your key, stored only in this browser.</p>
+          </div>
+
           <button id="analyzeBtn" class="wide-button" type="button" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5m0 14h16M8 16V9m4 7V6m4 10v-4"/></svg>
             Analyze
@@ -79,10 +138,16 @@
             <h2>Swatches</h2>
             <p id="statusLine">Load an image to begin.</p>
           </div>
-          <button id="addSwatchBtn" class="icon-button" type="button" disabled aria-label="Add swatch" title="Add swatch">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m7-7H5"/></svg>
-            <span>Add</span>
-          </button>
+          <div class="results-actions">
+            <button id="clearSwatchesBtn" class="icon-button" type="button" disabled aria-label="Clear all swatches" title="Clear all swatches">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-7 0v13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V7"/></svg>
+              <span>Clear</span>
+            </button>
+            <button id="addSwatchBtn" class="icon-button" type="button" disabled aria-label="Add swatch" title="Add swatch">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14m7-7H5"/></svg>
+              <span>Add</span>
+            </button>
+          </div>
         </div>
 
         <div class="table-wrap">
