@@ -432,7 +432,7 @@ function initAiLabeling() {
     // Turning AI on (with a key + image ready): re-extract the colors and label
     // them with the AI right away.
     if (state.aiEnabled && aiReady() && state.image) {
-      if (state.swatches.length) labelViaMarkers(++state.analyzeToken);
+      if (state.swatches.length) labelViaAi(++state.analyzeToken);
       else analyzeCurrentImage();
     }
   });
@@ -457,7 +457,7 @@ function initAiLabeling() {
       els.statusLine.textContent = "Load an image first.";
       return;
     }
-    if (state.swatches.length) labelViaMarkers(++state.analyzeToken);
+    if (state.swatches.length) labelViaAi(++state.analyzeToken);
     else analyzeCurrentImage();
   });
 }
@@ -697,7 +697,7 @@ function analyzeCurrentImage() {
     setReady(true);
     refreshExportPreview();
 
-    if (aiReady()) labelViaMarkers(analyzeToken);
+    if (aiReady()) labelViaAi(analyzeToken);
   });
 }
 
@@ -1215,10 +1215,11 @@ function nameSwatchesHeuristically() {
   assignTiers(swatches, stats, computeFamilies(swatches, stats));
 }
 
-// Group swatches by family, sort each group by L*, and label highlight /
-// midtone / shadow (or numbered tiers for >4). Same-family swatches whose a*/b*
-// differ markedly are treated as distinct PARTS, not tiers, so "roof tile" and
-// "roof trim" don't get collapsed into a single ramp.
+// Group swatches by family/material, sort each group by L* (light → dark), and
+// label highlight / midtone / shadow. The material identity comes from the label
+// (AI region or heuristic family), so members of one label ARE one material —
+// they tier by lightness, never split (which previously collapsed a highlight +
+// shadow into "Skin" / "Skin_2" instead of "Skin highlight" / "Skin shadow").
 function assignTiers(swatches, stats, family) {
   const groups = new Map();
   family.forEach((name, i) => {
@@ -1230,27 +1231,16 @@ function assignTiers(swatches, stats, family) {
   const finalName = new Array(swatches.length).fill("");
 
   for (const [name, members] of groups) {
-    // Singletons and structural roles get no tier.
+    // Single-instance colors and broad structural roles get no lightness tier.
     if (name === "Line art" || name === "Background" || name === "Sky" || members.length === 1) {
       for (const i of members) finalName[i] = name;
       continue;
     }
-    // Split a family into chroma/hue "parts" so different materials of the same
-    // hue family tier independently.
-    const parts = [];
-    for (const i of members) {
-      const st = stats[i];
-      let part = parts.find((p) => hueDistance(p.hue, st.hue) < 18 && Math.abs(p.chroma - st.chroma) < 22);
-      if (!part) { part = { hue: st.hue, chroma: st.chroma, items: [] }; parts.push(part); }
-      part.items.push(i);
-    }
-    for (const part of parts) {
-      const items = part.items.slice().sort((a, b) => stats[b].L - stats[a].L); // light → dark
-      const tiers = tierLabelsFor(items.length);
-      items.forEach((i, rank) => {
-        finalName[i] = tiers[rank] ? `${name} ${tiers[rank]}` : name;
-      });
-    }
+    const items = members.slice().sort((a, b) => stats[b].L - stats[a].L); // light → dark
+    const tiers = tierLabelsFor(items.length);
+    items.forEach((i, rank) => {
+      finalName[i] = tiers[rank] ? `${name} ${tiers[rank]}` : name;
+    });
   }
 
   swatches.forEach((swatch, i) => {
@@ -1283,7 +1273,7 @@ function tierLabelsFor(n) {
 // label tied to the right color (no more "sky labeled hair").
 // ---------------------------------------------------------------------------
 
-async function labelViaMarkers(token) {
+async function labelViaAi(token) {
   if (!state.image) {
     logLine("AI labeling skipped: no image loaded.", "warn");
     els.statusLine.textContent = "Load an image before labeling with AI.";
@@ -1307,50 +1297,50 @@ async function labelViaMarkers(token) {
   if (els.aiLabelBtn) els.aiLabelBtn.disabled = true;
 
   const model = (state.aiModels[providerId] || "").trim() || provider.defaultModel;
-  // Only colors with an on-image location can be marked. Number the MARKED
-  // colors contiguously (1..M) so the drawn markers exactly match the prompt's
-  // color table — anchorless colors (e.g. from a loaded project) are skipped on
-  // both sides, and labels map back to the original swatch via `marked`.
-  const marked = state.swatches
+  // The colors that have an on-image location (every extracted/picked color). We
+  // send the full image; the model returns labeled REGIONS; we then match each
+  // pick's coordinate into those regions deterministically (so a name can never
+  // land on the wrong color, unlike asking the model to read numbered dots).
+  const picks = state.swatches
     .map((swatch, index) => ({ swatch, index }))
-    .filter((m) => Number.isFinite(m.swatch.anchorX) && Number.isFinite(m.swatch.anchorY));
-  if (!marked.length) {
-    logLine("AI labeling skipped: no colors have an on-image location to mark.", "warn");
+    .filter((p) => Number.isFinite(p.swatch.anchorX) && Number.isFinite(p.swatch.anchorY));
+  if (!picks.length) {
+    logLine("AI labeling skipped: no colors have an on-image location.", "warn");
     els.statusLine.textContent = "These colors have no on-image location to label.";
     hideAiProgress();
     if (els.aiLabelBtn) els.aiLabelBtn.disabled = false;
     return;
   }
-  showAiProgress(`Preparing ${marked.length} markers…`);
-  logLine(`AI labeling: ${providerId} / ${model}, ${marked.length} markers.`, "ai");
-  const annotated = buildAnnotatedImageDataUrl(marked);
-  const prompt = buildMarkerLabelingPrompt(marked);
+  showAiProgress("Analyzing the image…");
+  logLine(`AI region analysis: ${providerId} / ${model}, ${picks.length} color picks.`, "ai");
+  const image = buildRegionAnalysisImage();
+  const prompt = buildRegionAnalysisPrompt(picks);
 
   try {
     setAiProgress(`Contacting ${providerId}…`);
-    let labels = await requestAiLabels(providerId, provider, key, model, prompt, annotated);
+    let regions = await requestAiRegions(providerId, provider, key, model, prompt, image);
     if (token !== state.analyzeToken) {
       logLine("AI labeling superseded by a newer request — discarded.", "warn");
       return;
     }
-    logLine(`AI returned ${labels.length} label${labels.length === 1 ? "" : "s"}.`, "ai");
-    // A response can occasionally come back unparseable — retry once.
-    if (!labels.length) {
+    logLine(`AI identified ${regions.length} region${regions.length === 1 ? "" : "s"}.`, "ai");
+    // An occasional unparseable response — retry once.
+    if (!regions.length) {
       setAiProgress("Empty response — retrying…");
-      logLine("Unparseable/empty response — retrying once.", "warn");
-      labels = await requestAiLabels(providerId, provider, key, model, prompt, annotated);
+      logLine("No regions parsed — retrying once.", "warn");
+      regions = await requestAiRegions(providerId, provider, key, model, prompt, image);
       if (token !== state.analyzeToken) return;
-      logLine(`Retry returned ${labels.length} label${labels.length === 1 ? "" : "s"}.`, "ai");
+      logLine(`Retry identified ${regions.length} region${regions.length === 1 ? "" : "s"}.`, "ai");
     }
 
-    setAiProgress("Applying labels…");
-    const named = applyAiLabels(labels, marked);
+    setAiProgress("Matching colors to regions…");
+    const named = assignRegionsToSwatches(regions, picks);
     renderSwatches();
     refreshExportPreview();
-    logLine(`AI labeled ${named} of ${state.swatches.length} colors.`, "ai");
+    logLine(`Matched ${named} of ${picks.length} color pick${picks.length === 1 ? "" : "s"} to regions.`, "ai");
     els.statusLine.textContent = named
-      ? `AI labeled ${named} color${named === 1 ? "" : "s"}.`
-      : "AI returned no usable labels — click Label with AI to try again.";
+      ? `AI matched ${named} color${named === 1 ? "" : "s"} to identified regions.`
+      : "AI returned no usable regions — click Label with AI to try again.";
   } catch (error) {
     if (token !== state.analyzeToken) return;
     logLine(`AI labeling failed: ${error.message}`, "error");
@@ -1361,8 +1351,8 @@ async function labelViaMarkers(token) {
   }
 }
 
-// One request → parsed [{i, object}] labels. Throws on HTTP error.
-async function requestAiLabels(providerId, provider, key, model, prompt, dataUrl) {
+// One request → parsed [{label, box}] regions. Throws on HTTP error.
+async function requestAiRegions(providerId, provider, key, model, prompt, dataUrl) {
   const request = buildAiRequest(providerId, key, model, prompt, dataUrl);
   logLine(`POST ${provider.url}`, "ai");
   const response = await fetch(provider.url, {
@@ -1382,14 +1372,14 @@ async function requestAiLabels(providerId, provider, key, model, prompt, dataUrl
     throw new Error(detail);
   }
   const json = await response.json();
-  return parseAiLabels(extractAiText(providerId, json));
+  return parseAiRegions(extractAiText(providerId, json));
 }
 
-// Draw the image with a numbered marker on each swatch's location, so the model
-// can identify what's at each marker rather than guessing coordinates.
-// `marked` is [{swatch, index}] of swatches that have an on-image anchor, in
-// marker order (numbered 1..marked.length).
-function buildAnnotatedImageDataUrl(marked) {
+// Render the image for region analysis with a faint 0–1000 reference grid (lines
+// + edge numbers every 100). The grid gives the vision model an explicit
+// coordinate frame, which markedly improves the bounding boxes it returns — and
+// those boxes are what we match the color picks against.
+function buildRegionAnalysisImage() {
   const source = state.image;
   const sourceWidth = source.naturalWidth || source.width;
   const sourceHeight = source.naturalHeight || source.height;
@@ -1402,32 +1392,24 @@ function buildAnnotatedImageDataUrl(marked) {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(source, 0, 0, width, height);
 
-  ctx.font = "bold 16px sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.lineJoin = "round";
-
-  // Color-bound markers: each disc is painted in the swatch's OWN color and
-  // ringed white + black, with a 1-based, auto-contrast number. Drawing the disc
-  // in the swatch color lets the model cross-check the index against the color
-  // list in the prompt, so labels bind to the right color.
-  marked.forEach(({ swatch }, markerIndex) => {
-    const x = swatch.anchorX * width;
-    const y = swatch.anchorY * height;
-    const radius = 13;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fillStyle = `rgb(${swatch.r}, ${swatch.g}, ${swatch.b})`;
-    ctx.fill();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = "#ffffff";
-    ctx.stroke();
+  ctx.font = "11px sans-serif";
+  ctx.textBaseline = "top";
+  for (let g = 0; g <= 10; g += 1) {
+    const gx = (g / 10) * width;
+    const gy = (g / 10) * height;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
     ctx.lineWidth = 1;
-    ctx.strokeStyle = "#000000";
-    ctx.stroke();
-    ctx.fillStyle = getBrightness(swatch.r, swatch.g, swatch.b) < 140 ? "#ffffff" : "#000000";
-    ctx.fillText(String(markerIndex + 1), x, y);
-  });
+    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(width, gy); ctx.stroke();
+    if (g > 0 && g < 10) {
+      const n = String(g * 100);
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";
+      ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
+      ctx.strokeText(n, gx + 2, 2); ctx.fillText(n, gx + 2, 2);
+      ctx.strokeText(n, 2, gy + 2); ctx.fillText(n, 2, gy + 2);
+    }
+  }
 
   return canvas.toDataURL("image/png");
 }
@@ -1443,7 +1425,7 @@ function buildAiRequest(providerId, key, model, prompt, dataUrl) {
       },
       body: {
         model,
-        max_tokens: 1024,
+        max_tokens: 2048,
         temperature: 0, // deterministic — consistent labeling run to run
         messages: [
           {
@@ -1494,32 +1476,40 @@ function extractAiText(providerId, json) {
     .join("\n");
 }
 
-function buildMarkerLabelingPrompt(marked) {
-  const count = marked.length;
-  const table = marked
-    .map(({ swatch }, i) => `  ${i + 1} = ${rgbToHex(swatch.r, swatch.g, swatch.b)} (${Math.round((swatch.coverage || 0) * 100)}% of image)`)
+// Ask the model to break the whole image into labeled regions with bounding
+// boxes in the 0–1000 grid frame. The app — not the model — then matches each
+// color pick's coordinate into those regions, so identification (the model's
+// strength) and assignment (deterministic geometry) are separated.
+function buildRegionAnalysisPrompt(picks) {
+  const coords = picks
+    .map((p, i) => `  pick ${i + 1}: (${Math.round(p.swatch.anchorX * 1000)}, ${Math.round(p.swatch.anchorY * 1000)})  ${rgbToHex(p.swatch.r, p.swatch.g, p.swatch.b)}`)
     .join("\n");
   return [
-    "This is a hand-painted, cel-shaded 2D animation still. It uses a SMALL set of FLAT colors;",
-    "the black line art is anti-aliased, so edges look blended — ignore those edge blends.",
-    `The image has ${count} numbered markers (1..${count}); each marker's disc is painted in the`,
-    "exact flat color it sits on. Here is each marker's color and how much of the image it covers:",
-    table,
+    "This is a 2D illustration / animation still. A faint reference grid is drawn over it:",
+    "coordinates run 0–1000 left→right (x) and 0–1000 top→bottom (y), with lines and numbers every 100.",
     "",
-    "For EACH marker number, name the MATERIAL or scene part it sits on, using concrete art/material",
-    "nouns: skin, hair, eyes, teeth, lips, shirt, sweater, denim, metal, glass, foliage, tree-trunk,",
-    "grass, roof-tiles, roof-trim, brick, stone, water, sky, cloud, ground, wood, fabric, plastic, line-art.",
-    "Do NOT say highlight, midtone, or shadow — lightness tiers are added automatically afterward.",
-    "Decide from the MARKED LOCATION; use the listed color only to confirm which region a marker is on.",
-    'If a marker sits on the black outline, answer "line-art". If you truly cannot tell, answer "unknown".',
+    "Identify EVERY distinct, nameable region — broad areas (background, sky, ground) AND specific",
+    "objects/materials/parts (skin, hair, beard, eyebrow, eye, teeth, lips, shirt, collar, jacket,",
+    "metal, glass, screen, keyboard, button, wood, foliage, line-art outline, …). Prefer MANY specific",
+    "regions over a few broad ones.",
+    "",
+    "For each region return a concise lowercase \"label\" and a TIGHT bounding \"box\" [x0,y0,x1,y1] in",
+    "0–1000 grid coordinates (origin top-left). If a region appears in separate places, return multiple",
+    "entries with the same label. Together the regions should cover the whole subject.",
+    "",
+    "The user sampled palette colors at these grid points — make sure a region covers each point:",
+    coords,
+    "",
     "Ignore any baked-in text, UI, watermark, or logo.",
     "",
-    "Return ONLY a JSON array, one entry per marker, no prose or code fences:",
-    '[{"i":1,"material":"skin"},{"i":2,"material":"roof-tiles"}]'
+    "Return ONLY a JSON array, no prose or code fences:",
+    '[{"label":"beard","box":[300,520,520,760]},{"label":"shirt","box":[520,640,980,1000]}]'
   ].join("\n");
 }
 
-function parseAiLabels(text) {
+// Parse [{label, box:[x0,y0,x1,y1]}]; normalize boxes to 0..1 (accepting either
+// 0..1 or 0..1000 inputs) and fix coordinate order.
+function parseAiRegions(text) {
   if (!text) return [];
   const start = text.indexOf("[");
   const end = text.lastIndexOf("]");
@@ -1527,32 +1517,72 @@ function parseAiLabels(text) {
   try {
     const parsed = JSON.parse(text.slice(start, end + 1));
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((entry) => entry && Number.isInteger(entry.i) && (entry.material || entry.object))
-      .map((entry) => ({ i: entry.i, material: String(entry.material || entry.object).trim() }));
+    const regions = [];
+    for (const entry of parsed) {
+      if (!entry || !entry.label || !Array.isArray(entry.box) || entry.box.length < 4) continue;
+      const raw = entry.box.map(Number);
+      if (!raw.every(Number.isFinite)) continue;
+      const scale = Math.max(...raw.map(Math.abs)) > 1.5 ? 1000 : 1;
+      const x0 = raw[0] / scale, y0 = raw[1] / scale, x1 = raw[2] / scale, y1 = raw[3] / scale;
+      const clamp = (v) => Math.max(0, Math.min(1, v));
+      regions.push({
+        label: String(entry.label).trim().toLowerCase(),
+        box: [clamp(Math.min(x0, x1)), clamp(Math.min(y0, y1)), clamp(Math.max(x0, x1)), clamp(Math.max(y0, y1))]
+      });
+    }
+    return regions;
   } catch (error) {
     return [];
   }
 }
 
-// Apply AI materials as base families, fall back to the heuristic family for any
-// unlabeled/unknown marker, then assign highlight/midtone/shadow tiers locally by
-// L* — the model never has to judge lightness. `marked` maps each 1-based marker
-// number back to its original swatch index.
-function applyAiLabels(labels, marked) {
+// Match each color pick's coordinate into the AI's regions: the smallest box
+// that CONTAINS the point wins (most specific); otherwise the nearest box within
+// a tolerance; otherwise the pick keeps its heuristic family. Then tier by L*.
+function assignRegionsToSwatches(regions, picks) {
   const swatches = state.swatches;
-  if (!labels.length || !swatches.length || !marked || !marked.length) return 0;
+  if (!swatches.length) return 0;
   const stats = computeNameStats(swatches);
-  const family = computeFamilies(swatches, stats);
-  let named = 0;
-  for (const { i, material } of labels) {
-    const entry = marked[i - 1]; // markers are 1-based and contiguous over `marked`
-    if (!entry || !material || material.toLowerCase() === "unknown") continue;
-    family[entry.index] = titleCase(material.replace(/[-_]+/g, " "));
-    named += 1;
+  const family = computeFamilies(swatches, stats); // heuristic baseline
+  let matched = 0;
+
+  if (regions && regions.length) {
+    for (const { swatch, index } of picks) {
+      const ax = swatch.anchorX;
+      const ay = swatch.anchorY;
+      let best = null;
+      let bestArea = Infinity;
+      for (const region of regions) {
+        const [x0, y0, x1, y1] = region.box;
+        if (ax >= x0 && ax <= x1 && ay >= y0 && ay <= y1) {
+          const area = (x1 - x0) * (y1 - y0);
+          if (area < bestArea) { bestArea = area; best = region; }
+        }
+      }
+      if (!best) {
+        let bestDistance = Infinity;
+        for (const region of regions) {
+          const d = pointBoxDistance(ax, ay, region.box);
+          if (d < bestDistance) { bestDistance = d; best = region; }
+        }
+        if (best && bestDistance > 0.12) best = null; // too far → keep heuristic name
+      }
+      if (best) {
+        family[index] = titleCase(best.label.replace(/[-_]+/g, " "));
+        matched += 1;
+      }
+    }
   }
+
   assignTiers(swatches, stats, family);
-  return named;
+  return matched;
+}
+
+function pointBoxDistance(px, py, box) {
+  const [x0, y0, x1, y1] = box;
+  const dx = Math.max(x0 - px, 0, px - x1);
+  const dy = Math.max(y0 - py, 0, py - y1);
+  return Math.hypot(dx, dy);
 }
 
 // Friendly primary-ish color name (Red/Green/Blue/...), unlike getHueFamily
@@ -2716,7 +2746,17 @@ window.PaletteBuilder = {
   buildAsePreview,
   getSwatches: () => state.swatches.map((swatch) => ({ ...swatch })),
   extractPalette,
-  nameSwatchesHeuristically
+  nameSwatchesHeuristically,
+  parseAiRegions,
+  // Test hook: match a regions array against the current swatches' anchors.
+  assignRegions: (regions) => {
+    const picks = state.swatches
+      .map((swatch, index) => ({ swatch, index }))
+      .filter((p) => Number.isFinite(p.swatch.anchorX) && Number.isFinite(p.swatch.anchorY));
+    const matched = assignRegionsToSwatches(regions, picks);
+    renderSwatches();
+    return matched;
+  }
 };
 
 // Optional ?demo bootstrap — runs last so every module constant is initialized.

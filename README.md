@@ -33,7 +33,9 @@ The **Color detail** slider trades fewer ↔ more colors; **Max colors** caps th
 
 ## How colors are named
 
-Each color gets a perceptual **color label** (e.g. "Pale ochre"). The **associated object** is named by role + material family + lightness tier, computed from CIELab values, coverage, and how much each color borders others: line art, background/sky, skin, foliage, or a plain hue descriptor — with same-family colors sorted by lightness into **highlight / midtone / shadow**. True scene understanding ("that's a roof") needs vision: an optional **AI object labeling** panel (bring your own Anthropic or OpenAI key) marks each color on the image and asks the model to name the material, then the lightness tiers are assigned locally. All names are editable before export.
+Each color gets a perceptual **color label** (e.g. "Pale ochre"). The **associated object** is named by role + material family + lightness tier, computed from CIELab values, coverage, and how much each color borders others: line art, background/sky, skin, foliage, or a plain hue descriptor — with same-family colors sorted by lightness into **highlight / midtone / shadow**.
+
+True scene understanding ("that's a roof") needs vision. The optional **AI object labeling** panel (bring your own Anthropic or OpenAI key) uses a region-matching approach: the whole image (with a faint 0–1000 reference grid) goes to the model, which returns a list of labeled **regions with bounding boxes**; the app then **deterministically matches each color pick's coordinate into those regions** (smallest containing box wins) and assigns lightness tiers locally. Separating *identification* (the model) from *assignment* (app geometry) means a name can't land on the wrong color. A strong vision model (Claude Opus 4.8 / Sonnet 4.6) gives the best region boxes. All names are editable before export.
 
 ## License
 
