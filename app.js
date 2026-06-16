@@ -59,7 +59,7 @@ const state = {
   exportPreviewMode: "txt",
   generatedAt: null,
   lastPixels: null,
-  lastDetections: null,
+  lastEdge: null,
   analyzeToken: 0,
   previewRect: null,
   view: null,
@@ -497,9 +497,8 @@ function refreshAiLabelButton() {
   els.aiLabelBtn.disabled = !(aiReady() && state.swatches.length);
 }
 
-if (new URLSearchParams(window.location.search).has("demo")) {
-  loadDemoImage();
-}
+// (?demo bootstrap runs at the end of the file, after all module constants are
+// initialized — see bottom.)
 
 async function loadImageFile(file) {
   const url = URL.createObjectURL(file);
@@ -681,82 +680,113 @@ function analyzeCurrentImage() {
   els.statusLine.textContent = "Analyzing image...";
   logLine("Analyzing image…");
   window.requestAnimationFrame(() => {
-    const pixels = sampleImage(state.image, els.ignoreTransparency.checked);
+    const bundle = sampleImage(state.image, els.ignoreTransparency.checked);
     state.generatedAt = new Date();
-    state.lastPixels = pixels;
-    state.lastDetections = null;
+    state.lastPixels = bundle;
     const analyzeToken = ++state.analyzeToken;
 
-    // Local extraction always finds the colors (sampled from real pixels, so they
-    // are exact). Then either the AI labels them (via on-image markers) or the
-    // local object detector does.
-    buildSwatchesFromPixels(pixels);
+    // Local extraction finds the exact flat colors. A deterministic namer assigns
+    // material/role + highlight/midtone/shadow tiers immediately; if an AI key is
+    // set, the marker-based vision pass then refines the object names.
+    buildSwatchesFromPixels(bundle);
+    nameSwatchesHeuristically();
 
     renderSwatches();
-    els.statusLine.textContent = `${state.swatches.length} colors captured from ${pixels.length.toLocaleString()} sampled pixels.`;
-    logLine(`Captured ${state.swatches.length} colors from ${pixels.length.toLocaleString()} sampled pixels.`);
+    els.statusLine.textContent = `${state.swatches.length} colors captured from ${bundle.count.toLocaleString()} sampled pixels.`;
+    logLine(`Captured ${state.swatches.length} colors from ${bundle.count.toLocaleString()} sampled pixels.`);
     setReady(true);
     refreshExportPreview();
 
-    if (aiReady()) {
-      labelViaMarkers(analyzeToken);
-    } else {
-      logLine("Identifying objects with the local model…");
-      identifyObjects(analyzeToken);
-    }
+    if (aiReady()) labelViaMarkers(analyzeToken);
   });
 }
 
-// Cluster the sampled pixels into swatches (color label only; object names are
-// filled in later by identifyObjects). Reused by the Color-detail control to
-// re-cluster instantly without re-sampling or re-running the model.
-function buildSwatchesFromPixels(pixels) {
-  const clusters = extractDistinctColors(pixels);
-  const sortedClusters = els.sortByCoverage.checked
-    ? clusters.sort((a, b) => b.count - a.count)
-    : clusters;
+// Extract the palette into swatches (color label only; object/material names
+// are filled in afterwards by nameSwatchesHeuristically or the AI). Reused by
+// the Color-detail control to re-extract instantly without re-sampling.
+function buildSwatchesFromPixels(bundle) {
+  const palette = extractPalette(bundle.data, bundle.width, bundle.height, {
+    detail: getColorDetail(),
+    maxColors: getMaxColors(),
+    skipTransparent: bundle.skipTransparent
+  });
+  const ordered = els.sortByCoverage.checked
+    ? palette.slice().sort((a, b) => b.count - a.count)
+    : palette;
 
   const usedNames = new Set();
-  state.swatches = sortedClusters.map((cluster, index) => {
-    const colorContext = describeColor(cluster);
-    const baseName = sanitizeName(colorContext.colorName || `Color_${index + 1}`);
+  state.swatches = ordered.map((color, index) => {
+    const colorName = makeReadableColorLabel(color.r, color.g, color.b);
+    const baseName = sanitizeName(colorName || `Color_${index + 1}`);
     return {
       id: makeHarmonyId(),
       swatchName: uniqueSwatchName(baseName, index, usedNames),
-      colorName: colorContext.colorName,
-      objectName: colorContext.objectName,
-      r: cluster.r,
-      g: cluster.g,
-      b: cluster.b,
+      colorName,
+      objectName: "",
+      r: color.r,
+      g: color.g,
+      b: color.b,
       a: 255,
-      coverage: cluster.count / pixels.length,
-      anchorX: cluster.centerX,
-      anchorY: cluster.centerY
+      coverage: 0,
+      anchorX: color.cx,
+      anchorY: color.cy
     };
   });
 
-  setDensestAnchors(pixels, state.swatches);
+  // One labeling pass yields coverage, the densest-region callout anchor, AND
+  // each color's edgeCoverage (cached for naming).
+  state.lastEdge = computeSwatchSpatial(bundle, state.swatches);
 }
 
-// Place each swatch's callout anchor on the densest patch of that color, not its
-// centroid. A color spread across several regions (e.g. a body color repeated on
-// four remotes) has a centroid in the empty space between them — the densest cell
-// instead lands the dot on a real instance of the color.
-function setDensestAnchors(pixels, swatches) {
-  if (!swatches.length) return;
+// A single nearest-swatch pass over the typed buffer that sets each swatch's
+// coverage and its densest-region callout anchor (a color repeated across
+// several regions has its centroid in the empty space between them — the densest
+// 36x24 cell instead lands the dot on a real instance), and returns each color's
+// edgeCoverage (fraction of its pixels bordering a DIFFERENT color — high for
+// line art). Replaces the former separate coverage/anchor and edge passes.
+function computeSwatchSpatial(bundle, swatches) {
+  if (!swatches.length || !bundle || !bundle.width) return swatches.map(() => 0);
+  const { data, width, height, skipTransparent } = bundle;
   const GX = 36;
   const GY = 24;
+  const npx = width * height;
+  const labels = new Int32Array(npx).fill(-1);
   const grids = swatches.map(() => new Int32Array(GX * GY));
+  const counts = new Array(swatches.length).fill(0);
+  let total = 0;
 
-  for (const pixel of pixels) {
-    const swatchIndex = nearestSwatchIndex(pixel, swatches);
+  for (let p = 0; p < npx; p += 1) {
+    const i = p * 4;
+    if (skipTransparent && data[i + 3] < 24) continue;
+    const swatchIndex = nearestSwatchIndex({ r: data[i], g: data[i + 1], b: data[i + 2] }, swatches);
+    labels[p] = swatchIndex;
     if (swatchIndex < 0) continue;
-    const cx = Math.min(GX - 1, Math.max(0, Math.floor(pixel.x * GX)));
-    const cy = Math.min(GY - 1, Math.max(0, Math.floor(pixel.y * GY)));
+    counts[swatchIndex] += 1;
+    total += 1;
+    const x = p % width;
+    const y = (p / width) | 0;
+    const cx = Math.min(GX - 1, Math.max(0, Math.floor((x / width) * GX)));
+    const cy = Math.min(GY - 1, Math.max(0, Math.floor((y / height) * GY)));
     grids[swatchIndex][cy * GX + cx] += 1;
   }
 
+  // edgeCoverage from the label map.
+  const edgeCount = new Float64Array(swatches.length);
+  for (let y = 0; y < height; y += 1)
+    for (let x = 0; x < width; x += 1) {
+      const p = y * width + x;
+      const lab = labels[p];
+      if (lab < 0) continue;
+      let bordered = false;
+      if (x > 0 && labels[p - 1] >= 0 && labels[p - 1] !== lab) bordered = true;
+      else if (x < width - 1 && labels[p + 1] >= 0 && labels[p + 1] !== lab) bordered = true;
+      else if (y > 0 && labels[p - width] >= 0 && labels[p - width] !== lab) bordered = true;
+      else if (y < height - 1 && labels[p + width] >= 0 && labels[p + width] !== lab) bordered = true;
+      if (bordered) edgeCount[lab] += 1;
+    }
+
   swatches.forEach((swatch, index) => {
+    swatch.coverage = total ? counts[index] / total : 0;
     const grid = grids[index];
     let bestCell = -1;
     let bestCount = 0;
@@ -772,6 +802,8 @@ function setDensestAnchors(pixels, swatches) {
     swatch.anchorX = (cx + 0.5) / GX;
     swatch.anchorY = (cy + 0.5) / GY;
   });
+
+  return swatches.map((s, i) => (counts[i] ? edgeCount[i] / counts[i] : 0));
 }
 
 // Re-assign every sampled pixel to its nearest swatch color and recompute each
@@ -779,15 +811,21 @@ function setDensestAnchors(pixels, swatches) {
 // re-targeted by dragging its dot, recolored, or removed) so the percentages
 // reflect the colors the user has identified.
 function recomputeCoverage() {
-  const pixels = state.lastPixels;
-  if (!pixels || !pixels.length || !state.swatches.length) return;
+  const bundle = state.lastPixels;
+  if (!bundle || !bundle.width || !state.swatches.length) return;
+  const { data, width, height, skipTransparent } = bundle;
   const counts = new Array(state.swatches.length).fill(0);
-  for (const pixel of pixels) {
-    const swatchIndex = nearestSwatchIndex(pixel, state.swatches);
+  let total = 0;
+  const npx = width * height;
+  for (let p = 0; p < npx; p += 1) {
+    const i = p * 4;
+    if (skipTransparent && data[i + 3] < 24) continue;
+    const swatchIndex = nearestSwatchIndex({ r: data[i], g: data[i + 1], b: data[i + 2] }, state.swatches);
     if (swatchIndex >= 0) counts[swatchIndex] += 1;
+    total += 1;
   }
   state.swatches.forEach((swatch, index) => {
-    swatch.coverage = counts[index] / pixels.length;
+    swatch.coverage = total ? counts[index] / total : 0;
   });
 }
 
@@ -796,16 +834,16 @@ function recomputeCoverage() {
 function reExtractColors() {
   if (!state.lastPixels) return;
   buildSwatchesFromPixels(state.lastPixels);
-  if (state.lastDetections) assignObjectsToSwatches(state.lastDetections);
+  nameSwatchesHeuristically();
   renderSwatches();
-  els.statusLine.textContent = `${state.swatches.length} colors captured from ${state.lastPixels.length.toLocaleString()} sampled pixels.`;
+  els.statusLine.textContent = `${state.swatches.length} colors captured from ${state.lastPixels.count.toLocaleString()} sampled pixels.`;
   refreshExportPreview();
 }
 
 function sampleImage(image, skipTransparent) {
-  // Use the image at (effectively) native resolution so no small color is lost
-  // to downscaling. We only scale down if an image is enormous, to bound memory
-  // — and even then we keep a large budget. No smoothing, so colors stay exact.
+  // Native-resolution sample (downscaled only if enormous, to bound memory), no
+  // smoothing so colors stay exact. Returns a lightweight ImageData bundle, not a
+  // 2.5M-object array — the extractor and coverage passes read the typed buffer.
   const sourceWidth = image.naturalWidth || image.width;
   const sourceHeight = image.naturalHeight || image.height;
   const maxSide = 2048;
@@ -823,66 +861,231 @@ function sampleImage(image, skipTransparent) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(image, 0, 0, width, height);
-
   const data = ctx.getImageData(0, 0, width, height).data;
-  const pixels = [];
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    if (skipTransparent && a < 24) continue;
-    pixels.push({
-      r: data[i],
-      g: data[i + 1],
-      b: data[i + 2],
-      a,
-      x: ((i / 4) % width) / width,
-      y: Math.floor(i / 4 / width) / height
-    });
+  let count = width * height;
+  if (skipTransparent) {
+    count = 0;
+    for (let i = 3; i < data.length; i += 4) if (data[i] >= 24) count += 1;
   }
-
-  return pixels.length ? pixels : [{ r: 255, g: 255, b: 255, a: 255, x: 0.5, y: 0.5 }];
+  return { data, width, height, skipTransparent: Boolean(skipTransparent), count };
 }
 
-function extractDistinctColors(pixels) {
-  // 0 = fewer colors (merge aggressively), 1 = capture more distinct colors.
-  const detail = getColorDetail();
-  const bins = buildColorBins(pixels);
+// ---------------------------------------------------------------------------
+// Flat-cel-art palette extraction (validated against a Node ground-truth suite).
+//
+// 1. Exact-color histogram — the true painted bytes, never an average.
+// 2. ±2 (±4 if noisy) NMS peak-snap: each mode is the local-argmax exact value
+//    with its dither/JPEG cloud's count folded in, so the reported byte is the
+//    real painted color even on noisy sources.
+// 3. Per-pixel labels → count, centroid, and SOLIDITY (fraction of a color's
+//    pixels whose 4-neighbors share its label). Flat fills are solid (~0.8+);
+//    anti-aliased edge bands are thin (~0.5). Solidity is the primary real-vs-AA
+//    signal and, unlike collinearity alone, never deletes a real midtone.
+// 4. Perceptual merge (CIEDE2000 < dEmerge, keeps the MODE) folds re-encodings
+//    while keeping distinct-but-close tiers (roof tile vs shadow) separate.
+// 5. Collinear-blend rejection in raw sRGB bytes, gated by endpoint DOMINANCE
+//    (a band's two parents each outnumber it >=4x) plus virtual BLACK/WHITE
+//    endpoints (line-art & bloom) and the solidity gate.
+// 6. A nearest-color coverage pass folds AA pixels into their parent fill.
+// ---------------------------------------------------------------------------
 
-  // Higher detail => smaller merge distance, lower count thresholds, higher cap,
-  // and less variant pruning, so genuinely distinct flat colors aren't collapsed.
-  const mergeDistance = Math.max(6, Math.round(chooseMergeDistance(bins.length, pixels.length) * lerp(1.6, 0.45, detail)));
-  const minimumCount = Math.max(1, Math.round(chooseMinimumCount(pixels.length, bins.length) * lerp(1.6, 0.4, detail)));
-  const accentCount = chooseAccentCount(pixels.length);
-  const vividAccentCount = chooseVividAccentCount(pixels.length);
-  const distinctCount = Math.max(3, Math.ceil(pixels.length * 0.0003));
-  // Palette size: an explicit user cap if set, otherwise derived from detail.
-  // This is independent of how aggressively similar colors merge (detail).
-  const userMax = getMaxColors();
-  const autoCap = Math.max(8, Math.round(lerp(14, 120, detail)));
-  const maxColors = Math.min(bins.length, userMax || autoCap);
-  const minorCoverage = lerp(0.006, 0, detail);
+const _labCache = new Map();
+function srgbToLab(r, g, b) {
+  const key = (r << 16) | (g << 8) | b;
+  let v = _labCache.get(key);
+  if (v) return v;
+  const lin = (c) => {
+    c /= 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const rl = lin(r), gl = lin(g), bl = lin(b);
+  const x = (rl * 0.4124 + gl * 0.3576 + bl * 0.1805) / 0.95047;
+  const y = rl * 0.2126 + gl * 0.7152 + bl * 0.0722;
+  const z = (rl * 0.0193 + gl * 0.1192 + bl * 0.9505) / 1.08883;
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const fx = f(x), fy = f(y), fz = f(z);
+  v = { L: 116 * fy - 16, a: 500 * (fx - fy), b: 200 * (fy - fz) };
+  _labCache.set(key, v);
+  return v;
+}
 
-  const merged = mergeClusters(bins, mergeDistance)
-    .filter((cluster) => !isAntiAliasFleck(cluster, pixels.length))
-    .sort((a, b) => b.count - a.count);
+function deltaE2000(l1, l2) {
+  const C1 = Math.hypot(l1.a, l1.b), C2 = Math.hypot(l2.a, l2.b);
+  const Cb = (C1 + C2) / 2;
+  const G = 0.5 * (1 - Math.sqrt(Cb ** 7 / (Cb ** 7 + 25 ** 7)));
+  const a1 = (1 + G) * l1.a, a2 = (1 + G) * l2.a;
+  const Cp1 = Math.hypot(a1, l1.b), Cp2 = Math.hypot(a2, l2.b);
+  const at1 = Math.atan2(l1.b, a1), at2 = Math.atan2(l2.b, a2);
+  const h1 = at1 * 180 / Math.PI + (at1 < 0 ? 360 : 0);
+  const h2 = at2 * 180 / Math.PI + (at2 < 0 ? 360 : 0);
+  const dL = l2.L - l1.L;
+  const dC = Cp2 - Cp1;
+  let dh = 0;
+  if (Cp1 * Cp2 !== 0) { dh = h2 - h1; if (dh > 180) dh -= 360; else if (dh < -180) dh += 360; }
+  const dH = 2 * Math.sqrt(Cp1 * Cp2) * Math.sin((dh * Math.PI / 180) / 2);
+  const Lb = (l1.L + l2.L) / 2, Cbp = (Cp1 + Cp2) / 2;
+  let hb;
+  if (Cp1 * Cp2 === 0) hb = h1 + h2;
+  else { hb = h1 + h2; if (Math.abs(h1 - h2) > 180) hb += hb < 360 ? 360 : -360; hb /= 2; }
+  const T = 1 - 0.17 * Math.cos((hb - 30) * Math.PI / 180) + 0.24 * Math.cos((2 * hb) * Math.PI / 180)
+    + 0.32 * Math.cos((3 * hb + 6) * Math.PI / 180) - 0.20 * Math.cos((4 * hb - 63) * Math.PI / 180);
+  const dTheta = 30 * Math.exp(-(((hb - 275) / 25) ** 2));
+  const Rc = 2 * Math.sqrt(Cbp ** 7 / (Cbp ** 7 + 25 ** 7));
+  const Sl = 1 + (0.015 * (Lb - 50) ** 2) / Math.sqrt(20 + (Lb - 50) ** 2);
+  const Sc = 1 + 0.045 * Cbp;
+  const Sh = 1 + 0.015 * Cbp * T;
+  const Rt = -Math.sin(2 * dTheta * Math.PI / 180) * Rc;
+  return Math.sqrt((dL / Sl) ** 2 + (dC / Sc) ** 2 + (dH / Sh) ** 2 + Rt * (dC / Sc) * (dH / Sh));
+}
 
-  // Greedy selection (largest first) so the "distinct" test compares each smaller
-  // color against the colors already kept. Goal: keep every genuinely different
-  // color, while still folding near-duplicate anti-aliasing into its parent.
-  const kept = [];
-  for (const cluster of merged) {
-    const major = cluster.count >= minimumCount;
-    const accent = cluster.count >= accentCount && isAccentColor(cluster);
-    // Strongly saturated marks (e.g. LED buttons) survive at a very low count.
-    const vivid = cluster.count >= vividAccentCount && isVividAccent(cluster);
-    // A modestly sized color that is far from every kept color is a real, distinct
-    // shade (not a slight variation) — keep it even if muted.
-    const distinct =
-      cluster.count >= distinctCount && kept.every((k) => colorDistance(cluster, k) > 50);
-    if (major || accent || vivid || distinct) kept.push(cluster);
+const deltaE76sq = (a, b) => (a.L - b.L) ** 2 + (a.a - b.a) ** 2 + (a.b - b.b) ** 2;
+
+// Extract the flat palette from raw RGBA ImageData. Returns colors with exact
+// {r,g,b}, coverage (0..1), solidity, and centroid {cx,cy} in image fractions.
+function extractPalette(data, width, height, options = {}) {
+  const detail = Math.max(0, Math.min(1, options.detail ?? 0.55));
+  const maxColors = options.maxColors || null;
+  const skipTransparent = options.skipTransparent !== false;
+  const npx = width * height;
+
+  const hist = new Map();
+  let total = 0;
+  for (let p = 0; p < npx; p += 1) {
+    const i = p * 4;
+    if (skipTransparent && data[i + 3] < 24) continue;
+    const ek = ((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
+    hist.set(ek, (hist.get(ek) || 0) + 1);
+    total += 1;
+  }
+  if (!total) return [];
+
+  // A clean cel has few exact colors; many means JPEG/dither noise → widen the
+  // NMS cube so each fill's cloud collapses to one solid mode.
+  const noisy = hist.size > Math.max(1000, total * 0.01);
+  const nmsR = noisy ? 4 : 2;
+
+  const seedFloor = Math.max(1, Math.floor(total * 0.00008));
+  const entries = [...hist.entries()].sort((a, b) => b[1] - a[1]);
+  const claimed = new Set();
+  const peaks = [];
+  for (const [ek, c] of entries) {
+    if (c < seedFloor && peaks.length) break;
+    if (claimed.has(ek)) continue;
+    const r = (ek >> 16) & 255, g = (ek >> 8) & 255, b = ek & 255;
+    let sum = 0;
+    for (let dr = -nmsR; dr <= nmsR; dr += 1)
+      for (let dg = -nmsR; dg <= nmsR; dg += 1)
+        for (let db = -nmsR; db <= nmsR; db += 1) {
+          const nr = r + dr, ng = g + dg, nb = b + db;
+          if (nr < 0 || nr > 255 || ng < 0 || ng > 255 || nb < 0 || nb > 255) continue;
+          const nk = ((nr << 16) | (ng << 8) | nb) >>> 0;
+          const nc = hist.get(nk);
+          if (nc && !claimed.has(nk)) { claimed.add(nk); sum += nc; }
+        }
+    peaks.push({ r, g, b, count: sum, idx: peaks.length });
+    if (peaks.length >= 256) break; // bound the nearest-peak loop on noisy photos
   }
 
-  return pruneMinorVariants(kept, pixels.length, minorCoverage).slice(0, maxColors);
+  const peakLab = peaks.map((p) => srgbToLab(p.r, p.g, p.b));
+  const labelOf = new Map();
+  for (const ek of hist.keys()) {
+    const lab = srgbToLab((ek >> 16) & 255, (ek >> 8) & 255, ek & 255);
+    let best = 0, bd = Infinity;
+    for (let k = 0; k < peaks.length; k += 1) { const d = deltaE76sq(lab, peakLab[k]); if (d < bd) { bd = d; best = k; } }
+    labelOf.set(ek, best);
+  }
+  const labels = new Int32Array(npx).fill(-1);
+  const count = new Float64Array(peaks.length);
+  const sumX = new Float64Array(peaks.length);
+  const sumY = new Float64Array(peaks.length);
+  for (let p = 0; p < npx; p += 1) {
+    const i = p * 4;
+    if (skipTransparent && data[i + 3] < 24) continue;
+    const ek = ((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) >>> 0;
+    const lab = labelOf.get(ek);
+    labels[p] = lab;
+    count[lab] += 1;
+    sumX[lab] += p % width;
+    sumY[lab] += (p / width) | 0;
+  }
+  const solidSum = new Float64Array(peaks.length);
+  for (let y = 0; y < height; y += 1)
+    for (let x = 0; x < width; x += 1) {
+      const p = y * width + x;
+      const lab = labels[p];
+      if (lab < 0) continue;
+      let same = 0;
+      if (x > 0 && labels[p - 1] === lab) same += 1;
+      if (x < width - 1 && labels[p + 1] === lab) same += 1;
+      if (y > 0 && labels[p - width] === lab) same += 1;
+      if (y < height - 1 && labels[p + width] === lab) same += 1;
+      solidSum[lab] += same;
+    }
+
+  let list = peaks.map((s, k) => ({
+    r: s.r, g: s.g, b: s.b, lab: peakLab[k],
+    count: count[k],
+    solidity: count[k] ? solidSum[k] / (4 * count[k]) : 0,
+    cx: count[k] ? sumX[k] / count[k] / width : 0.5,
+    cy: count[k] ? sumY[k] / count[k] / height : 0.5,
+  }));
+
+  const minCov = lerp(0.0045, 0.00025, detail);
+  const minSolid = lerp(0.62, 0.5, detail);
+  const bypassCov = 0.02;
+  const dEmerge = lerp(4.0, 1.2, detail);
+  // Thin black line art is genuinely low-solidity but is a wanted color, so
+  // near-black ink bypasses the solidity gate (AA near black is caught below).
+  const isInk = (c) => Math.max(c.r, c.g, c.b) <= 40;
+
+  list = list
+    .filter((c) => c.count / total >= minCov && (c.solidity >= minSolid || c.count / total >= bypassCov || isInk(c)))
+    .sort((a, b) => b.count - a.count);
+
+  const merged = [];
+  for (const c of list) {
+    const host = merged.find((h) => deltaE2000(h.lab, c.lab) < dEmerge);
+    if (host) { host.count += c.count; continue; }
+    merged.push({ ...c });
+  }
+
+  const DOM = 4;
+  const BLACK = { r: 0, g: 0, b: 0, count: Infinity };
+  const WHITE = { r: 255, g: 255, b: 255, count: Infinity };
+  merged.sort((a, b) => b.count - a.count);
+  const survivors = [];
+  for (const c of merged) {
+    const endpoints = survivors.concat([BLACK, WHITE]);
+    if (c.solidity < 0.72 && c.count / total < 0.01 && isAntiAliasBlend(c, endpoints, DOM)) continue;
+    survivors.push(c);
+  }
+
+  survivors.sort((a, b) => b.count - a.count);
+  const capped = maxColors ? survivors.slice(0, maxColors) : survivors;
+  return capped.map((c) => ({ r: c.r, g: c.g, b: c.b, solidity: c.solidity, cx: c.cx, cy: c.cy, count: c.count }));
+}
+
+// X is an anti-alias band iff some ordered pair of endpoints (each outnumbering
+// X by DOM x) is collinear with X in raw sRGB bytes (interior t, small residual).
+function isAntiAliasBlend(c, endpoints, DOM) {
+  for (let i = 0; i < endpoints.length; i += 1) {
+    const a = endpoints[i];
+    if (a.count < c.count * DOM) continue;
+    for (let j = 0; j < endpoints.length; j += 1) {
+      if (j === i) continue;
+      const b = endpoints[j];
+      if (b.count < c.count * DOM) continue;
+      const abx = b.r - a.r, aby = b.g - a.g, abz = b.b - a.b;
+      const len2 = abx * abx + aby * aby + abz * abz;
+      if (len2 < 144) continue;
+      const t = ((c.r - a.r) * abx + (c.g - a.g) * aby + (c.b - a.b) * abz) / len2;
+      if (t <= 0.12 || t >= 0.88) continue;
+      const resid = Math.sqrt((c.r - (a.r + t * abx)) ** 2 + (c.g - (a.g + t * aby)) ** 2 + (c.b - (a.b + t * abz)) ** 2);
+      if (resid <= Math.max(2.5, 0.06 * Math.sqrt(len2))) return true;
+    }
+  }
+  return false;
 }
 
 function getColorDetail() {
@@ -901,235 +1104,173 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-function buildColorBins(pixels) {
-  const bins = new Map();
-  for (const pixel of pixels) {
-    const key = `${pixel.r >> 3},${pixel.g >> 3},${pixel.b >> 3}`;
-    const bin = bins.get(key) || makeCluster(pixel);
-    addPixelToCluster(bin, pixel);
-    bins.set(key, bin);
-  }
-
-  return [...bins.values()].map(finalizeCluster);
-}
-
-function chooseMergeDistance(binCount, pixelCount) {
-  const complexity = binCount / Math.max(1, pixelCount);
-  if (binCount <= 32) return 8;
-  if (binCount <= 96) return 14;
-  if (binCount <= 240) return 18;
-  if (complexity < 0.08) return 21;
-  if (complexity < 0.18) return 24;
-  return 28;
-}
-
-function chooseMinimumCount(pixelCount, binCount) {
-  if (binCount <= 64) return Math.max(2, Math.ceil(pixelCount * 0.00035));
-  return Math.max(4, Math.ceil(pixelCount * 0.0012));
-}
-
-function chooseAccentCount(pixelCount) {
-  return Math.max(8, Math.ceil(pixelCount * 0.00045));
-}
-
-function chooseVividAccentCount(pixelCount) {
-  // Low floor so tiny-but-distinct saturated marks (e.g. LED lights) survive.
-  return Math.max(3, Math.ceil(pixelCount * 0.00003));
-}
-
-function chooseMaximumColors(binCount) {
-  if (binCount <= 96) return 32;
-  if (binCount <= 320) return 44;
-  return 64;
-}
-
-function isAccentColor(cluster) {
-  return getSaturation(cluster.r, cluster.g, cluster.b) > 0.38 || colorDistance(cluster, { r: 0, g: 0, b: 0 }) < 42;
-}
-
-function isVividAccent(cluster) {
-  // Strong saturation marks an intentional color (LED, accent), as opposed to
-  // anti-aliasing blends, which sit between two colors at low saturation.
-  return getSaturation(cluster.r, cluster.g, cluster.b) > 0.45;
-}
-
-function isAntiAliasFleck(cluster, pixelCount) {
-  const coverage = cluster.count / pixelCount;
-  const saturation = getSaturation(cluster.r, cluster.g, cluster.b);
-  const brightness = getBrightness(cluster.r, cluster.g, cluster.b);
-  return coverage < 0.0008 && saturation < 0.22 && brightness > 35 && brightness < 235;
-}
-
-function pruneMinorVariants(clusters, pixelCount, minorCoverage = 0.003) {
-  const selected = [];
-
-  for (const cluster of clusters) {
-    const coverage = cluster.count / pixelCount;
-    const nearbyMajor = selected.find((chosen) => colorDistance(cluster, chosen) < 48);
-
-    if (coverage < minorCoverage && nearbyMajor) continue;
-    selected.push(cluster);
-  }
-
-  return selected;
-}
-
-function makeCluster(seed) {
-  return {
-    r: seed.r,
-    g: seed.g,
-    b: seed.b,
-    sumR: 0,
-    sumG: 0,
-    sumB: 0,
-    sumX: 0,
-    sumY: 0,
-    minX: 1,
-    minY: 1,
-    maxX: 0,
-    maxY: 0,
-    count: 0
-  };
-}
-
-function addPixelToCluster(cluster, pixel) {
-  cluster.sumR += pixel.r;
-  cluster.sumG += pixel.g;
-  cluster.sumB += pixel.b;
-  cluster.sumX += pixel.x;
-  cluster.sumY += pixel.y;
-  cluster.minX = Math.min(cluster.minX, pixel.x);
-  cluster.minY = Math.min(cluster.minY, pixel.y);
-  cluster.maxX = Math.max(cluster.maxX, pixel.x);
-  cluster.maxY = Math.max(cluster.maxY, pixel.y);
-  cluster.count += 1;
-}
-
-function finalizeCluster(cluster) {
-  return {
-    ...cluster,
-    r: Math.round(cluster.sumR / cluster.count),
-    g: Math.round(cluster.sumG / cluster.count),
-    b: Math.round(cluster.sumB / cluster.count),
-    centerX: cluster.sumX / cluster.count,
-    centerY: cluster.sumY / cluster.count
-  };
-}
-
-function mergeClusters(clusters, mergeDistance) {
-  const sorted = [...clusters].sort((a, b) => b.count - a.count);
-  const merged = [];
-
-  for (const cluster of sorted) {
-    const target = merged.find((existing) => colorDistance(cluster, existing) <= mergeDistance);
-    if (target) {
-      const total = target.count + cluster.count;
-      target.r = Math.round((target.r * target.count + cluster.r * cluster.count) / total);
-      target.g = Math.round((target.g * target.count + cluster.g * cluster.count) / total);
-      target.b = Math.round((target.b * target.count + cluster.b * cluster.count) / total);
-      target.centerX = (target.centerX * target.count + cluster.centerX * cluster.count) / total;
-      target.centerY = (target.centerY * target.count + cluster.centerY * cluster.count) / total;
-      target.minX = Math.min(target.minX, cluster.minX);
-      target.minY = Math.min(target.minY, cluster.minY);
-      target.maxX = Math.max(target.maxX, cluster.maxX);
-      target.maxY = Math.max(target.maxY, cluster.maxY);
-      target.count = total;
-    } else {
-      merged.push({ ...cluster });
-    }
-  }
-
-  return merged;
-}
-
+// Plain Euclidean RGB distance, used for nearest-swatch assignment (coverage,
+// anchors, edge analysis). Uniform weighting — the old luminance weights crushed
+// blue to 0.11 and over-merged distinct blues.
 function colorDistance(a, b) {
   const dr = a.r - b.r;
   const dg = a.g - b.g;
   const db = a.b - b.b;
-  return Math.sqrt(dr * dr * 0.3 + dg * dg * 0.59 + db * db * 0.11);
+  return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
-function describeColor(cluster) {
-  // Color label comes from the pixels. The "associated object" is left empty
-  // here and filled in afterwards by the object detector (identifyObjects).
-  return {
-    colorName: makeReadableColorLabel(cluster.r, cluster.g, cluster.b),
-    objectName: ""
-  };
+// Circular distance between two hue angles (0..360), so reds at 358° and 2° read
+// as 4° apart, not 356°.
+function hueDistance(h1, h2) {
+  const d = Math.abs(h1 - h2) % 360;
+  return d > 180 ? 360 - d : d;
 }
 
 // ---------------------------------------------------------------------------
-// In-browser object detection (Transformers.js, loaded lazily from a CDN).
+// Deterministic, no-AI object/material naming for cel art.
 //
-// The image is processed entirely on-device — only the model weights download
-// once, then the browser caches them. After detection, each color swatch is
-// named after the real-world object most of its pixels belong to (a per-pixel
-// majority vote). Colors that don't sit inside any detected object keep their
-// color-only label. NOTE: these models are trained on photographs, so on
-// stylized/illustrated art they may recognize little or nothing — in which
-// case swatches gracefully stay color-named rather than mislabeled.
+// True scene understanding ("that's a roof") needs vision — that's the optional
+// AI path below. Without a key we still give useful names by ROLE + MATERIAL
+// FAMILY + LIGHTNESS TIER, computed from each color's CIELab values, coverage,
+// and how much of it borders other colors (edgeCoverage):
+//   • thin, near-black, high-edge  -> "Line art"
+//   • largest low-chroma region    -> "Background" (or "Sky" if blue + up high)
+//   • warm mid-tone skin range     -> "Skin"
+//   • green                        -> "Foliage"
+//   • otherwise                    -> a plain "<Hue> <tier>" descriptor
+// Colors of the same family are then sorted by L* and labelled highlight /
+// midtone / shadow — ground-truth ordering, never a model's guess at a tier.
 // ---------------------------------------------------------------------------
 
-const OBJECT_DETECTION = {
-  libUrl: "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1",
-  model: "Xenova/detr-resnet-50",
-  scoreThreshold: 0.35, // minimum confidence to trust a detected box
-  assignThreshold: 0.2 // a swatch must have >=20% of its pixels inside an object to adopt its name
-};
-
-let detectorPromise = null;
-
-async function getDetector() {
-  if (!detectorPromise) {
-    const { pipeline, env } = await import(OBJECT_DETECTION.libUrl);
-    env.allowLocalModels = false; // weights come from the Hugging Face hub CDN
-    detectorPromise = pipeline("object-detection", OBJECT_DETECTION.model);
+// Per-swatch edgeCoverage: fraction of a color's pixels that sit next to a
+// DIFFERENT palette color. Line art borders everything (high); a big flat fill
+// barely borders anything (low). Computed once over the sampled bundle.
+function computeEdgeCoverage(bundle, swatches) {
+  const result = new Array(swatches.length).fill(0);
+  if (!bundle || !bundle.width || !swatches.length) return result;
+  const { data, width, height, skipTransparent } = bundle;
+  const labels = new Int32Array(width * height).fill(-1);
+  for (let p = 0; p < width * height; p += 1) {
+    const i = p * 4;
+    if (skipTransparent && data[i + 3] < 24) continue;
+    labels[p] = nearestSwatchIndex({ r: data[i], g: data[i + 1], b: data[i + 2] }, swatches);
   }
-  return detectorPromise;
+  const own = new Float64Array(swatches.length);
+  const edge = new Float64Array(swatches.length);
+  for (let y = 0; y < height; y += 1)
+    for (let x = 0; x < width; x += 1) {
+      const p = y * width + x;
+      const lab = labels[p];
+      if (lab < 0) continue;
+      own[lab] += 1;
+      let bordered = false;
+      if (x > 0 && labels[p - 1] !== lab && labels[p - 1] >= 0) bordered = true;
+      else if (x < width - 1 && labels[p + 1] !== lab && labels[p + 1] >= 0) bordered = true;
+      else if (y > 0 && labels[p - width] !== lab && labels[p - width] >= 0) bordered = true;
+      else if (y < height - 1 && labels[p + width] !== lab && labels[p + width] >= 0) bordered = true;
+      if (bordered) edge[lab] += 1;
+    }
+  for (let k = 0; k < swatches.length; k += 1) result[k] = own[k] ? edge[k] / own[k] : 0;
+  return result;
 }
 
-async function identifyObjects(analyzeToken) {
-  if (!state.image || !state.swatches.length) return;
+// Per-swatch stats used by naming. Hue/saturation are HSV (so simpleHueName +
+// the family ranges read naturally as color names); lightness L* and chroma are
+// CIELab (so tiering is perceptually ordered).
+function computeNameStats(swatches) {
+  // Reuse the edgeCoverage computed during extraction; recompute only if stale
+  // (e.g. the palette was hand-edited before an AI labeling pass).
+  const edgeCov = state.lastEdge && state.lastEdge.length === swatches.length
+    ? state.lastEdge
+    : computeEdgeCoverage(state.lastPixels, swatches);
+  return swatches.map((s, i) => {
+    const lab = srgbToLab(s.r, s.g, s.b);
+    return {
+      i,
+      L: lab.L,
+      chroma: Math.hypot(lab.a, lab.b),
+      hue: getHue(s.r, s.g, s.b),
+      sat: getSaturation(s.r, s.g, s.b),
+      coverage: s.coverage || 0,
+      edge: edgeCov[i],
+      anchorY: s.anchorY ?? 0.5
+    };
+  });
+}
 
-  const baseStatus = els.statusLine.textContent;
-  els.statusLine.textContent = `${baseStatus} Identifying objects…`;
+// Base FAMILY (role/material) per swatch from color + geometry, no tier yet.
+function computeFamilies(swatches, stats) {
+  let bgIndex = -1, bgCov = 0.25;
+  for (const st of stats) if (st.sat < 0.28 && st.coverage > bgCov) { bgCov = st.coverage; bgIndex = st.i; }
+  return swatches.map((s, i) => {
+    const st = stats[i];
+    if (st.L < 26 && st.sat < 0.45 && st.edge > 0.4) return "Line art";
+    if (i === bgIndex) return st.sat > 0.08 && st.hue >= 185 && st.hue <= 255 && st.anchorY < 0.5 ? "Sky" : "Background";
+    if (st.hue >= 18 && st.hue <= 48 && st.sat >= 0.12 && st.sat <= 0.7 && st.L >= 45 && st.L <= 92) return "Skin";
+    if (st.hue >= 75 && st.hue <= 165 && st.sat > 0.15) return "Foliage";
+    if (st.sat < 0.1) return "Neutral";
+    return titleCase(simpleHueName(st.hue));
+  });
+}
 
-  let detections;
-  try {
-    const detector = await getDetector();
-    if (analyzeToken !== state.analyzeToken) return; // a newer analysis superseded this run
-    const raw = await detector(imageToDataUrl(state.image), {
-      threshold: OBJECT_DETECTION.scoreThreshold,
-      percentage: true // box coordinates as 0..1 fractions, matching our sampled pixel coords
-    });
-    detections = Array.isArray(raw) ? raw : [];
-  } catch (error) {
-    // Model couldn't load (e.g. offline). Still apply color-based roles
-    // (background, line art, indicator lights) — just without object nouns.
-    if (analyzeToken !== state.analyzeToken) return;
-    state.lastDetections = [];
-    const fallbackNamed = assignObjectsToSwatches([]);
-    renderSwatches();
-    refreshExportPreview();
-    els.statusLine.textContent = fallbackNamed
-      ? `${baseStatus} Object model unavailable — named ${fallbackNamed} by color role.`
-      : `${baseStatus} Object recognition unavailable — color labels only.`;
-    return;
+function nameSwatchesHeuristically() {
+  const swatches = state.swatches;
+  if (!swatches.length) return;
+  const stats = computeNameStats(swatches);
+  assignTiers(swatches, stats, computeFamilies(swatches, stats));
+}
+
+// Group swatches by family, sort each group by L*, and label highlight /
+// midtone / shadow (or numbered tiers for >4). Same-family swatches whose a*/b*
+// differ markedly are treated as distinct PARTS, not tiers, so "roof tile" and
+// "roof trim" don't get collapsed into a single ramp.
+function assignTiers(swatches, stats, family) {
+  const groups = new Map();
+  family.forEach((name, i) => {
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(i);
+  });
+
+  const usedNames = new Set();
+  const finalName = new Array(swatches.length).fill("");
+
+  for (const [name, members] of groups) {
+    // Singletons and structural roles get no tier.
+    if (name === "Line art" || name === "Background" || name === "Sky" || members.length === 1) {
+      for (const i of members) finalName[i] = name;
+      continue;
+    }
+    // Split a family into chroma/hue "parts" so different materials of the same
+    // hue family tier independently.
+    const parts = [];
+    for (const i of members) {
+      const st = stats[i];
+      let part = parts.find((p) => hueDistance(p.hue, st.hue) < 18 && Math.abs(p.chroma - st.chroma) < 22);
+      if (!part) { part = { hue: st.hue, chroma: st.chroma, items: [] }; parts.push(part); }
+      part.items.push(i);
+    }
+    for (const part of parts) {
+      const items = part.items.slice().sort((a, b) => stats[b].L - stats[a].L); // light → dark
+      const tiers = tierLabelsFor(items.length);
+      items.forEach((i, rank) => {
+        finalName[i] = tiers[rank] ? `${name} ${tiers[rank]}` : name;
+      });
+    }
   }
 
-  if (analyzeToken !== state.analyzeToken) return;
+  swatches.forEach((swatch, i) => {
+    const name = finalName[i];
+    if (!name) return;
+    swatch.objectName = name;
+    swatch.swatchName = uniqueSwatchName(sanitizeName(name), i, usedNames);
+  });
+}
 
-  state.lastDetections = detections;
-  const named = assignObjectsToSwatches(detections);
-  if (analyzeToken !== state.analyzeToken) return;
-
-  renderSwatches();
-  refreshExportPreview();
-  if (named) {
-    els.statusLine.textContent = `${baseStatus} Named ${named} swatch${named === 1 ? "" : "es"} (${detections.length} object${detections.length === 1 ? "" : "s"} detected).`;
-  } else {
-    els.statusLine.textContent = `${baseStatus} No objects recognized — color labels only.`;
-  }
+function tierLabelsFor(n) {
+  if (n <= 1) return [""];
+  if (n === 2) return ["highlight", "shadow"];
+  if (n === 3) return ["highlight", "midtone", "shadow"];
+  if (n === 4) return ["highlight", "light midtone", "midtone", "shadow"];
+  const labels = new Array(n);
+  labels[0] = "highlight";
+  labels[n - 1] = "shadow";
+  for (let k = 1; k < n - 1; k += 1) labels[k] = `midtone ${k}`;
+  return labels;
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,10 +1307,24 @@ async function labelViaMarkers(token) {
   if (els.aiLabelBtn) els.aiLabelBtn.disabled = true;
 
   const model = (state.aiModels[providerId] || "").trim() || provider.defaultModel;
-  showAiProgress(`Preparing ${state.swatches.length} markers…`);
-  logLine(`AI labeling: ${providerId} / ${model}, ${state.swatches.length} swatches.`, "ai");
-  const annotated = buildAnnotatedImageDataUrl(state.swatches);
-  const prompt = buildMarkerLabelingPrompt(state.swatches.length);
+  // Only colors with an on-image location can be marked. Number the MARKED
+  // colors contiguously (1..M) so the drawn markers exactly match the prompt's
+  // color table — anchorless colors (e.g. from a loaded project) are skipped on
+  // both sides, and labels map back to the original swatch via `marked`.
+  const marked = state.swatches
+    .map((swatch, index) => ({ swatch, index }))
+    .filter((m) => Number.isFinite(m.swatch.anchorX) && Number.isFinite(m.swatch.anchorY));
+  if (!marked.length) {
+    logLine("AI labeling skipped: no colors have an on-image location to mark.", "warn");
+    els.statusLine.textContent = "These colors have no on-image location to label.";
+    hideAiProgress();
+    if (els.aiLabelBtn) els.aiLabelBtn.disabled = false;
+    return;
+  }
+  showAiProgress(`Preparing ${marked.length} markers…`);
+  logLine(`AI labeling: ${providerId} / ${model}, ${marked.length} markers.`, "ai");
+  const annotated = buildAnnotatedImageDataUrl(marked);
+  const prompt = buildMarkerLabelingPrompt(marked);
 
   try {
     setAiProgress(`Contacting ${providerId}…`);
@@ -1189,7 +1344,7 @@ async function labelViaMarkers(token) {
     }
 
     setAiProgress("Applying labels…");
-    const named = applyAiLabels(labels);
+    const named = applyAiLabels(labels, marked);
     renderSwatches();
     refreshExportPreview();
     logLine(`AI labeled ${named} of ${state.swatches.length} colors.`, "ai");
@@ -1232,7 +1387,9 @@ async function requestAiLabels(providerId, provider, key, model, prompt, dataUrl
 
 // Draw the image with a numbered marker on each swatch's location, so the model
 // can identify what's at each marker rather than guessing coordinates.
-function buildAnnotatedImageDataUrl(swatches) {
+// `marked` is [{swatch, index}] of swatches that have an on-image anchor, in
+// marker order (numbered 1..marked.length).
+function buildAnnotatedImageDataUrl(marked) {
   const source = state.image;
   const sourceWidth = source.naturalWidth || source.width;
   const sourceHeight = source.naturalHeight || source.height;
@@ -1245,25 +1402,31 @@ function buildAnnotatedImageDataUrl(swatches) {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(source, 0, 0, width, height);
 
-  ctx.font = "bold 15px sans-serif";
+  ctx.font = "bold 16px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.lineJoin = "round";
 
-  swatches.forEach((swatch, index) => {
-    if (!Number.isFinite(swatch.anchorX) || !Number.isFinite(swatch.anchorY)) return;
+  // Color-bound markers: each disc is painted in the swatch's OWN color and
+  // ringed white + black, with a 1-based, auto-contrast number. Drawing the disc
+  // in the swatch color lets the model cross-check the index against the color
+  // list in the prompt, so labels bind to the right color.
+  marked.forEach(({ swatch }, markerIndex) => {
     const x = swatch.anchorX * width;
     const y = swatch.anchorY * height;
-    const radius = 12;
+    const radius = 13;
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.fillStyle = `rgb(${swatch.r}, ${swatch.g}, ${swatch.b})`;
     ctx.fill();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = "#111111";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#ffffff";
     ctx.stroke();
-    ctx.fillStyle = "#111111";
-    ctx.fillText(String(index), x, y);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#000000";
+    ctx.stroke();
+    ctx.fillStyle = getBrightness(swatch.r, swatch.g, swatch.b) < 140 ? "#ffffff" : "#000000";
+    ctx.fillText(String(markerIndex + 1), x, y);
   });
 
   return canvas.toDataURL("image/png");
@@ -1331,17 +1494,28 @@ function extractAiText(providerId, json) {
     .join("\n");
 }
 
-function buildMarkerLabelingPrompt(count) {
+function buildMarkerLabelingPrompt(marked) {
+  const count = marked.length;
+  const table = marked
+    .map(({ swatch }, i) => `  ${i + 1} = ${rgbToHex(swatch.r, swatch.g, swatch.b)} (${Math.round((swatch.coverage || 0) * 100)}% of image)`)
+    .join("\n");
   return [
-    `The attached image has ${count} numbered markers (white circles, numbered 0 to ${count - 1}).`,
-    "Each marker is placed on a distinct color used in the artwork.",
-    "For EACH marker number, identify the object or part of the artwork at that exact marked spot",
-    '(e.g. "hair", "hair shadow", "glasses frame", "sky", "cloud", "tree shadow", "skin", "shirt", "outline").',
-    "Decide from the MARKED LOCATION in the image — not from the color alone. Be specific, and distinguish highlight / midtone / shadow of the same material.",
-    "Ignore any text, UI, watermarks, or logos baked into the image.",
+    "This is a hand-painted, cel-shaded 2D animation still. It uses a SMALL set of FLAT colors;",
+    "the black line art is anti-aliased, so edges look blended — ignore those edge blends.",
+    `The image has ${count} numbered markers (1..${count}); each marker's disc is painted in the`,
+    "exact flat color it sits on. Here is each marker's color and how much of the image it covers:",
+    table,
     "",
-    "Return ONLY a JSON array with one entry per marker, no prose or code fences:",
-    '[{"i":0,"object":"hair"},{"i":1,"object":"sky"}]'
+    "For EACH marker number, name the MATERIAL or scene part it sits on, using concrete art/material",
+    "nouns: skin, hair, eyes, teeth, lips, shirt, sweater, denim, metal, glass, foliage, tree-trunk,",
+    "grass, roof-tiles, roof-trim, brick, stone, water, sky, cloud, ground, wood, fabric, plastic, line-art.",
+    "Do NOT say highlight, midtone, or shadow — lightness tiers are added automatically afterward.",
+    "Decide from the MARKED LOCATION; use the listed color only to confirm which region a marker is on.",
+    'If a marker sits on the black outline, answer "line-art". If you truly cannot tell, answer "unknown".',
+    "Ignore any baked-in text, UI, watermark, or logo.",
+    "",
+    "Return ONLY a JSON array, one entry per marker, no prose or code fences:",
+    '[{"i":1,"material":"skin"},{"i":2,"material":"roof-tiles"}]'
   ].join("\n");
 }
 
@@ -1354,168 +1528,31 @@ function parseAiLabels(text) {
     const parsed = JSON.parse(text.slice(start, end + 1));
     if (!Array.isArray(parsed)) return [];
     return parsed
-      .filter((entry) => entry && Number.isInteger(entry.i) && entry.object)
-      .map((entry) => ({ i: entry.i, object: String(entry.object).trim() }));
+      .filter((entry) => entry && Number.isInteger(entry.i) && (entry.material || entry.object))
+      .map((entry) => ({ i: entry.i, material: String(entry.material || entry.object).trim() }));
   } catch (error) {
     return [];
   }
 }
 
-function applyAiLabels(labels) {
-  if (!labels.length) return 0;
-  const usedNames = new Set(state.swatches.map((swatch) => swatch.swatchName));
-  let named = 0;
-  for (const { i, object } of labels) {
-    const swatch = state.swatches[i];
-    if (!swatch || !object) continue;
-    swatch.objectName = titleCase(object);
-    swatch.swatchName = uniqueSwatchName(sanitizeName(swatch.objectName), i, usedNames);
-    named += 1;
-  }
-  return named;
-}
-
-function assignObjectsToSwatches(detections) {
-  const pixels = state.lastPixels;
+// Apply AI materials as base families, fall back to the heuristic family for any
+// unlabeled/unknown marker, then assign highlight/midtone/shadow tiers locally by
+// L* — the model never has to judge lightness. `marked` maps each 1-based marker
+// number back to its original swatch index.
+function applyAiLabels(labels, marked) {
   const swatches = state.swatches;
-  if (!pixels || !pixels.length || !swatches.length) return 0;
-
-  // Which detected object (if any) holds most of each swatch's pixels.
-  const votes = voteObjectNouns(detections, pixels, swatches);
-  // Resolve a differentiated role name per swatch (background, outlines, body,
-  // buttons, indicator light, hand, ...) by combining detection with color role.
-  const names = resolveSwatchRoles(swatches, votes);
-
-  const usedNames = new Set(swatches.map((swatch) => swatch.swatchName));
+  if (!labels.length || !swatches.length || !marked || !marked.length) return 0;
+  const stats = computeNameStats(swatches);
+  const family = computeFamilies(swatches, stats);
   let named = 0;
-  swatches.forEach((swatch, index) => {
-    const object = names[index];
-    if (!object) return;
-    swatch.objectName = object;
-    swatch.swatchName = uniqueSwatchName(sanitizeName(object), index, usedNames);
+  for (const { i, material } of labels) {
+    const entry = marked[i - 1]; // markers are 1-based and contiguous over `marked`
+    if (!entry || !material || material.toLowerCase() === "unknown") continue;
+    family[entry.index] = titleCase(material.replace(/[-_]+/g, " "));
     named += 1;
-  });
-  return named;
-}
-
-// For each swatch, find the detected object whose box contains most of that
-// swatch's pixels. Returns [{ noun, frac }] aligned to swatches (noun is null
-// when no object covers at least assignThreshold of the swatch's pixels).
-function voteObjectNouns(detections, pixels, swatches) {
-  const boxes = (detections || [])
-    .map((detection) => {
-      const box = detection.box || {};
-      return {
-        label: detection.label,
-        xmin: box.xmin,
-        ymin: box.ymin,
-        xmax: box.xmax,
-        ymax: box.ymax,
-        area: Math.max(0, box.xmax - box.xmin) * Math.max(0, box.ymax - box.ymin)
-      };
-    })
-    .filter((box) => Number.isFinite(box.area) && box.area > 0)
-    .sort((a, b) => a.area - b.area); // smallest first => most specific object wins
-
-  const tally = swatches.map(() => ({ total: 0, counts: new Map() }));
-  for (const pixel of pixels) {
-    const swatchIndex = nearestSwatchIndex(pixel, swatches);
-    if (swatchIndex < 0) continue;
-    const record = tally[swatchIndex];
-    record.total += 1;
-    if (!boxes.length) continue;
-    const box = boxes.find(
-      (candidate) =>
-        pixel.x >= candidate.xmin &&
-        pixel.x <= candidate.xmax &&
-        pixel.y >= candidate.ymin &&
-        pixel.y <= candidate.ymax
-    );
-    if (!box) continue;
-    record.counts.set(box.label, (record.counts.get(box.label) || 0) + 1);
   }
-
-  return tally.map((record) => {
-    let noun = null;
-    let best = 0;
-    for (const [label, count] of record.counts) {
-      if (count > best) {
-        best = count;
-        noun = label;
-      }
-    }
-    const frac = record.total ? best / record.total : 0;
-    return { noun: frac >= OBJECT_DETECTION.assignThreshold ? noun : null, frac };
-  });
-}
-
-// Differentiated naming: detection supplies the object noun ("remote", "person"),
-// while color/coverage cues separate background, line art, body vs. buttons, and
-// small saturated accents (indicator lights). Returns a name per swatch ("" = keep
-// color-only label).
-function resolveSwatchRoles(swatches, votes) {
-  const stats = swatches.map((swatch) => ({
-    brightness: getBrightness(swatch.r, swatch.g, swatch.b),
-    saturation: getSaturation(swatch.r, swatch.g, swatch.b),
-    hue: getHue(swatch.r, swatch.g, swatch.b),
-    coverage: swatch.coverage || 0
-  }));
-
-  // Background: the most-covered broad, desaturated color.
-  let bgIndex = -1;
-  let bgCoverage = 0;
-  stats.forEach((stat, i) => {
-    if (stat.saturation < 0.18 && stat.coverage > 0.25 && stat.coverage > bgCoverage) {
-      bgCoverage = stat.coverage;
-      bgIndex = i;
-    }
-  });
-
-  // Outlines / line art: the darkest color, if it is clearly dark.
-  let darkIndex = -1;
-  let darkest = Infinity;
-  stats.forEach((stat, i) => {
-    if (stat.brightness < darkest) {
-      darkest = stat.brightness;
-      darkIndex = i;
-    }
-  });
-  if (darkest >= 55) darkIndex = -1;
-
-  // Rank swatches sharing a detected noun by coverage, so the biggest area of an
-  // object reads as its "body" and the rest as "buttons / detail".
-  const nounGroups = {};
-  votes.forEach((vote, i) => {
-    if (i === bgIndex || i === darkIndex || !vote.noun) return;
-    (nounGroups[vote.noun] = nounGroups[vote.noun] || []).push(i);
-  });
-  Object.values(nounGroups).forEach((group) => group.sort((a, b) => stats[b].coverage - stats[a].coverage));
-
-  return swatches.map((swatch, i) => {
-    if (i === bgIndex) return "Background";
-    if (i === darkIndex) return "Outlines / line art";
-
-    const vote = votes[i];
-    const { hue, saturation, brightness, coverage } = stats[i];
-
-    if (vote.noun === "person" || (hue >= 20 && hue <= 55 && saturation > 0.35 && brightness > 120)) {
-      return "Hand / skin";
-    }
-
-    // Small, vivid blobs read as indicator lights — checked before the object
-    // branch so a red/green/blue light on the remote isn't folded into "buttons".
-    if (saturation > 0.5 && coverage < 0.05) {
-      return `${titleCase(simpleHueName(hue))} indicator light`;
-    }
-
-    if (vote.noun) {
-      const noun = titleCase(vote.noun);
-      const group = nounGroups[vote.noun];
-      return group && group[0] === i ? `${noun} body` : `${noun} buttons / detail`;
-    }
-
-    return ""; // nothing confident — keep the plain color label
-  });
+  assignTiers(swatches, stats, family);
+  return named;
 }
 
 // Friendly primary-ish color name (Red/Green/Blue/...), unlike getHueFamily
@@ -2124,7 +2161,6 @@ function addPickedSwatch(color, anchorX, anchorY) {
 
 function clearSwatches() {
   state.swatches = [];
-  state.lastDetections = null;
   state.analyzeToken += 1; // cancel any in-flight analysis / labeling
   renderSwatches();
   refreshExportPreview();
@@ -2274,7 +2310,6 @@ async function loadProject(data) {
     state.image = null;
     state.lastPixels = null;
   }
-  state.lastDetections = null;
   state.generatedAt = new Date();
   state.analyzeToken += 1; // cancel any in-flight analysis from a prior image
 
@@ -2652,5 +2687,12 @@ window.PaletteBuilder = {
   buildAcoPreview,
   buildAseBytes,
   buildAsePreview,
-  getSwatches: () => state.swatches.map((swatch) => ({ ...swatch }))
+  getSwatches: () => state.swatches.map((swatch) => ({ ...swatch })),
+  extractPalette,
+  nameSwatchesHeuristically
 };
+
+// Optional ?demo bootstrap — runs last so every module constant is initialized.
+if (new URLSearchParams(window.location.search).has("demo")) {
+  loadDemoImage();
+}

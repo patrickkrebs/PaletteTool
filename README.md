@@ -19,7 +19,21 @@ The `.aco` exporter writes an Adobe Color Swatches file — load it in Photoshop
 
 The `.ase` exporter writes an Adobe Swatch Exchange file, the cross-app swatch format read by Photoshop, Illustrator, and InDesign (Swatches panel → **Open/Load Swatch Library**). Each swatch is a named RGB color entry (`ASEF` signature, version 1.0, big-endian float channels).
 
-The app automatically determines practical palette colors from the image, grouping anti-aliased edge pixels into representative color families instead of dumping every RGB variant. Color labels and associated objects are generated from a curated color vocabulary plus image-position heuristics, and can be edited before export.
+## How the palette is extracted
+
+The tool is tuned for **flat, cel-shaded 2D animation art** (e.g. Photoshop-painted stills), where each material is a few flat colors and the black line art is anti-aliased so edges *look* blended. It recovers the real flat colors at their **exact painted values** rather than averaging them:
+
+1. **Exact-color histogram** of the sampled pixels (no quantization, no averaging).
+2. **Mode peaks** via a small non-maximum-suppression cube, so a color spread by JPEG/dither noise still resolves to its true painted byte.
+3. **Anti-alias rejection** — a band that is a linear blend between two stronger colors (a fill and the black line, a fill and white, or two fills) is dropped. The discriminator is **solidity** (flat fills are solid; AA bands are thin), backed by a collinearity test with endpoint-dominance, so a genuine midtone that happens to sit between a highlight and a shadow is *kept*, not mistaken for anti-aliasing.
+4. **Perceptual merge** (CIEDE2000) folds re-encodings while keeping distinct-but-close tiers (roof tile vs. roof shadow) separate.
+5. Every pixel (including the anti-aliased ones) is attributed to its nearest flat color for an accurate coverage %.
+
+The **Color detail** slider trades fewer ↔ more colors; **Max colors** caps the palette.
+
+## How colors are named
+
+Each color gets a perceptual **color label** (e.g. "Pale ochre"). The **associated object** is named by role + material family + lightness tier, computed from CIELab values, coverage, and how much each color borders others: line art, background/sky, skin, foliage, or a plain hue descriptor — with same-family colors sorted by lightness into **highlight / midtone / shadow**. True scene understanding ("that's a roof") needs vision: an optional **AI object labeling** panel (bring your own Anthropic or OpenAI key) marks each color on the image and asks the model to name the material, then the lightness tiers are assigned locally. All names are editable before export.
 
 ## License
 
