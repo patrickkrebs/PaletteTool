@@ -42,7 +42,13 @@ const els = {
   previewAcoBtn: document.querySelector("#previewAcoBtn"),
   previewAseBtn: document.querySelector("#previewAseBtn"),
   swatchTable: document.querySelector("#swatchTable"),
-  rowTemplate: document.querySelector("#swatchRowTemplate")
+  rowTemplate: document.querySelector("#swatchRowTemplate"),
+  aiProgress: document.querySelector("#aiProgress"),
+  aiProgressLabel: document.querySelector("#aiProgressLabel"),
+  logPanel: document.querySelector("#logPanel"),
+  logHead: document.querySelector("#logHead"),
+  logOutput: document.querySelector("#logOutput"),
+  logClearBtn: document.querySelector("#logClearBtn")
 };
 
 const state = {
@@ -100,7 +106,65 @@ function aiProvider() {
 window.__paletteBuilderErrors = [];
 window.addEventListener("error", (event) => {
   window.__paletteBuilderErrors.push(event.message);
+  logLine(`Error: ${event.message}`, "error");
 });
+window.addEventListener("unhandledrejection", (event) => {
+  logLine(`Unhandled: ${event.reason?.message || event.reason}`, "error");
+});
+
+// ---------------------------------------------------------------------------
+// Activity log — a bottom console that shows what the app is doing, so failures
+// (e.g. "no image loaded") are visible instead of silent.
+// ---------------------------------------------------------------------------
+
+const LOG_MAX_LINES = 400;
+
+function logLine(message, level = "info") {
+  if (typeof console !== "undefined" && console.log) console.log(`[PaletteBuilder] ${message}`);
+  if (!els.logOutput) return;
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  const line = document.createElement("div");
+  line.className = `log-line${level && level !== "info" ? ` is-${level}` : ""}`;
+  const stamp = document.createElement("span");
+  stamp.className = "log-time";
+  stamp.textContent = time;
+  line.appendChild(stamp);
+  line.appendChild(document.createTextNode(message));
+  els.logOutput.appendChild(line);
+  while (els.logOutput.childElementCount > LOG_MAX_LINES) {
+    els.logOutput.removeChild(els.logOutput.firstChild);
+  }
+  els.logOutput.scrollTop = els.logOutput.scrollHeight;
+}
+
+if (els.logHead) {
+  els.logHead.addEventListener("click", (event) => {
+    if (event.target === els.logClearBtn) return;
+    els.logPanel.classList.toggle("is-collapsed");
+  });
+}
+if (els.logClearBtn) {
+  els.logClearBtn.addEventListener("click", () => {
+    els.logOutput.innerHTML = "";
+    logLine("Log cleared.");
+  });
+}
+
+function showAiProgress(label) {
+  if (!els.aiProgress) return;
+  els.aiProgress.hidden = false;
+  if (els.aiProgressLabel) els.aiProgressLabel.textContent = label;
+}
+
+function setAiProgress(label) {
+  if (els.aiProgressLabel) els.aiProgressLabel.textContent = label;
+}
+
+function hideAiProgress() {
+  if (els.aiProgress) els.aiProgress.hidden = true;
+}
+
+logLine("PaletteBuilder ready. Load an image to begin.");
 
 els.imageInput.addEventListener("change", (event) => {
   const [file] = event.target.files;
@@ -173,14 +237,36 @@ if (els.clearSwatchesBtn) {
   els.clearSwatchesBtn.addEventListener("click", clearSwatches);
 }
 
-// Click the image in pick mode to sample that pixel and drop a labelled swatch.
-els.previewCanvas.addEventListener("click", (event) => {
+// In pick mode, press on the image to open a magnifier loupe (same zoom as the
+// dot drag), aim while holding, and release to drop a labelled swatch there.
+els.previewCanvas.addEventListener("pointerdown", (event) => {
   if (!state.pickMode || !state.image || !state.previewRect) return;
-  const rect = els.overlayLayer.getBoundingClientRect();
-  const mapped = displayToImage(event.clientX - rect.left, event.clientY - rect.top);
-  if (!mapped) return;
-  const color = sampleBitmapColor(mapped.bx, mapped.by) || { r: 128, g: 128, b: 128 };
-  addPickedSwatch(color, mapped.anchorX, mapped.anchorY);
+  event.preventDefault();
+  const layerRect = els.overlayLayer.getBoundingClientRect();
+  const loupe = createLoupe();
+  els.overlayLayer.appendChild(loupe.el);
+  els.previewCanvas.setPointerCapture(event.pointerId);
+
+  let pending = null;
+  const aim = (clientX, clientY) => {
+    const mapped = displayToImage(clientX - layerRect.left, clientY - layerRect.top);
+    if (!mapped) return;
+    const color = sampleBitmapColor(mapped.bx, mapped.by);
+    pending = { color: color || { r: 128, g: 128, b: 128 }, anchorX: mapped.anchorX, anchorY: mapped.anchorY };
+    loupe.update(mapped, color, layerRect);
+  };
+
+  aim(event.clientX, event.clientY);
+  const onMove = (moveEvent) => aim(moveEvent.clientX, moveEvent.clientY);
+  const onUp = () => {
+    els.previewCanvas.releasePointerCapture(event.pointerId);
+    els.previewCanvas.removeEventListener("pointermove", onMove);
+    els.previewCanvas.removeEventListener("pointerup", onUp);
+    loupe.el.remove();
+    if (pending) addPickedSwatch(pending.color, pending.anchorX, pending.anchorY);
+  };
+  els.previewCanvas.addEventListener("pointermove", onMove);
+  els.previewCanvas.addEventListener("pointerup", onUp);
 });
 
 let reExtractTimer = null;
@@ -265,6 +351,12 @@ function initAiLabeling() {
     persistAi(`pb_ai_model_${state.aiProvider}`, state.aiModels[state.aiProvider]);
   });
   els.aiLabelBtn.addEventListener("click", () => {
+    logLine("“Label with AI” clicked.");
+    if (!state.image) {
+      logLine("Nothing to do: no image loaded. Drop an image (or open a project) first.", "warn");
+      els.statusLine.textContent = "Load an image first.";
+      return;
+    }
     if (state.swatches.length) labelViaMarkers(++state.analyzeToken);
     else analyzeCurrentImage();
   });
@@ -319,7 +411,10 @@ async function loadImageFile(file) {
     drawPreview(image);
     els.emptyPreview.hidden = true;
     setReady(true);
+    logLine(`Loaded "${file.name}" (${image.naturalWidth || image.width}×${image.naturalHeight || image.height}).`);
     analyzeCurrentImage();
+  } catch (error) {
+    logLine(`Failed to load image "${file.name}": ${error.message || error}`, "error");
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -423,6 +518,7 @@ function analyzeCurrentImage() {
   if (!state.image) return;
 
   els.statusLine.textContent = "Analyzing image...";
+  logLine("Analyzing image…");
   window.requestAnimationFrame(() => {
     const pixels = sampleImage(state.image, els.ignoreTransparency.checked);
     state.generatedAt = new Date();
@@ -437,12 +533,14 @@ function analyzeCurrentImage() {
 
     renderSwatches();
     els.statusLine.textContent = `${state.swatches.length} colors captured from ${pixels.length.toLocaleString()} sampled pixels.`;
+    logLine(`Captured ${state.swatches.length} colors from ${pixels.length.toLocaleString()} sampled pixels.`);
     setReady(true);
     refreshExportPreview();
 
     if (aiReady()) {
       labelViaMarkers(analyzeToken);
     } else {
+      logLine("Identifying objects with the local model…");
       identifyObjects(analyzeToken);
     }
   });
@@ -884,11 +982,21 @@ async function identifyObjects(analyzeToken) {
 // ---------------------------------------------------------------------------
 
 async function labelViaMarkers(token) {
-  if (!state.image || !state.swatches.length) return;
+  if (!state.image) {
+    logLine("AI labeling skipped: no image loaded.", "warn");
+    els.statusLine.textContent = "Load an image before labeling with AI.";
+    return;
+  }
+  if (!state.swatches.length) {
+    logLine("AI labeling skipped: no colors yet — run Analyze first.", "warn");
+    els.statusLine.textContent = "Analyze (or pick) some colors before labeling with AI.";
+    return;
+  }
   const providerId = state.aiProvider;
   const provider = aiProvider();
   const key = (state.aiKeys[providerId] || "").trim();
   if (!key) {
+    logLine(`AI labeling skipped: no ${provider.keyLabel} entered.`, "warn");
     els.statusLine.textContent = `Add your ${provider.keyLabel} to label with AI.`;
     return;
   }
@@ -897,29 +1005,42 @@ async function labelViaMarkers(token) {
   if (els.aiLabelBtn) els.aiLabelBtn.disabled = true;
 
   const model = (state.aiModels[providerId] || "").trim() || provider.defaultModel;
+  showAiProgress(`Preparing ${state.swatches.length} markers…`);
+  logLine(`AI labeling: ${providerId} / ${model}, ${state.swatches.length} swatches.`, "ai");
   const annotated = buildAnnotatedImageDataUrl(state.swatches);
   const prompt = buildMarkerLabelingPrompt(state.swatches.length);
 
   try {
+    setAiProgress(`Contacting ${providerId}…`);
     let labels = await requestAiLabels(providerId, provider, key, model, prompt, annotated);
-    if (token !== state.analyzeToken) return;
+    if (token !== state.analyzeToken) {
+      logLine("AI labeling superseded by a newer request — discarded.", "warn");
+      return;
+    }
+    logLine(`AI returned ${labels.length} label${labels.length === 1 ? "" : "s"}.`, "ai");
     // A response can occasionally come back unparseable — retry once.
     if (!labels.length) {
-      els.statusLine.textContent = "Labeling with AI… (retrying)";
+      setAiProgress("Empty response — retrying…");
+      logLine("Unparseable/empty response — retrying once.", "warn");
       labels = await requestAiLabels(providerId, provider, key, model, prompt, annotated);
       if (token !== state.analyzeToken) return;
+      logLine(`Retry returned ${labels.length} label${labels.length === 1 ? "" : "s"}.`, "ai");
     }
 
+    setAiProgress("Applying labels…");
     const named = applyAiLabels(labels);
     renderSwatches();
     refreshExportPreview();
+    logLine(`AI labeled ${named} of ${state.swatches.length} colors.`, "ai");
     els.statusLine.textContent = named
       ? `AI labeled ${named} color${named === 1 ? "" : "s"}.`
       : "AI returned no usable labels — click Label with AI to try again.";
   } catch (error) {
     if (token !== state.analyzeToken) return;
+    logLine(`AI labeling failed: ${error.message}`, "error");
     els.statusLine.textContent = `AI labeling failed: ${error.message}. Color labels kept.`;
   } finally {
+    hideAiProgress();
     refreshAiLabelButton();
   }
 }
@@ -927,11 +1048,13 @@ async function labelViaMarkers(token) {
 // One request → parsed [{i, object}] labels. Throws on HTTP error.
 async function requestAiLabels(providerId, provider, key, model, prompt, dataUrl) {
   const request = buildAiRequest(providerId, key, model, prompt, dataUrl);
+  logLine(`POST ${provider.url}`, "ai");
   const response = await fetch(provider.url, {
     method: "POST",
     headers: request.headers,
     body: JSON.stringify(request.body)
   });
+  logLine(`Response: HTTP ${response.status} ${response.statusText || ""}`.trim(), response.ok ? "ai" : "error");
   if (!response.ok) {
     let detail = `HTTP ${response.status}`;
     try {
@@ -1542,12 +1665,37 @@ function renderOverlay() {
     input.setAttribute("aria-label", "Callout name");
     input.addEventListener("input", () => applySwatchName(swatch.id, input.value, input));
 
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "overlay-del";
+    del.title = "Delete this color";
+    del.setAttribute("aria-label", "Delete this color");
+    del.textContent = "×";
+    del.addEventListener("pointerdown", (event) => event.stopPropagation());
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      removeSwatchById(swatch.id);
+    });
+
     callout.appendChild(grip);
     callout.appendChild(input);
+    callout.appendChild(del);
     layer.appendChild(callout);
 
     attachCalloutDrag(grip, callout, line, marker);
   }
+}
+
+// Remove a swatch (used by the callout's delete button), keeping coverage and the
+// overlay in sync.
+function removeSwatchById(id) {
+  const index = state.swatches.findIndex((swatch) => swatch.id === id);
+  if (index < 0) return;
+  const removed = state.swatches[index];
+  state.swatches.splice(index, 1);
+  recomputeCoverage();
+  renderSwatches();
+  logLine(`Removed "${removed.objectName || removed.colorName || removed.swatchName}".`);
 }
 
 // Point the leader line at the label's edge that faces the dot.
@@ -1819,6 +1967,7 @@ function clearSwatches() {
   state.analyzeToken += 1; // cancel any in-flight analysis / labeling
   renderSwatches();
   refreshExportPreview();
+  logLine("Palette cleared.");
   els.statusLine.textContent = state.pickMode
     ? "Cleared. Click the image to start laying down colors."
     : "Palette cleared.";
@@ -1878,6 +2027,7 @@ function projectToData() {
 function downloadProject() {
   const name = sanitizeName(els.paletteName.value) || "palette";
   saveTextFile(`${name}_project.json`, JSON.stringify(projectToData(), null, 2));
+  logLine(`Saved project "${name}_project.json" (${state.swatches.length} colors).`);
 }
 
 function restoreSwatchesFromData(dataSwatches) {
@@ -1901,12 +2051,15 @@ function restoreSwatchesFromData(dataSwatches) {
 
 async function loadProjectFile(file) {
   try {
+    logLine(`Loading project "${file.name}"…`);
     const data = JSON.parse(await file.text());
     if (!data || typeof data !== "object" || !Array.isArray(data.swatches)) {
       throw new Error("not a PaletteBuilder project file");
     }
     await loadProject(data);
+    logLine(`Loaded project: ${data.swatches.length} colors${data.image ? " + image" : ""}.`);
   } catch (error) {
+    logLine(`Could not load project: ${error.message}`, "error");
     els.statusLine.textContent = `Could not load project: ${error.message}`;
   }
 }

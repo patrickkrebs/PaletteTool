@@ -122,6 +122,10 @@
               <select id="aiModel"></select>
             </div>
             <button id="aiLabelBtn" class="wide-button subtle" type="button" disabled>Label with AI</button>
+            <div id="aiProgress" class="ai-progress" hidden>
+              <div class="ai-progress-track"><div class="ai-progress-bar"></div></div>
+              <span id="aiProgressLabel" class="ai-progress-label">Working…</span>
+            </div>
             <p id="aiNote" class="ai-note">Labels the extracted colors by reading markers placed on the image. Sends the image to Anthropic using your key, stored only in this browser.</p>
           </div>
 
@@ -207,6 +211,16 @@
         </td>
       </tr>
     </template>
+
+    <section id="logPanel" class="log-panel" aria-label="Activity log">
+      <div id="logHead" class="log-head">
+        <h3>Activity log</h3>
+        <span id="logHint" class="log-hint">click to collapse</span>
+        <button id="logClearBtn" class="log-btn" type="button">Clear</button>
+        <span id="logCaret" class="log-caret" aria-hidden="true">▾</span>
+      </div>
+      <div id="logOutput" class="log-output" role="log" aria-live="polite"></div>
+    </section>
 
     <script src="./app.js"></script>
   </body>
