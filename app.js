@@ -2393,14 +2393,37 @@ function downloadPlt() {
   saveTextFile(`${sanitizeName(els.paletteName.value)}.plt`, buildHarmonyPalette());
 }
 
+// Disambiguate repeated names for export so two swatches never share a name in
+// the file (the editable UI still allows free typing). Appends "<joiner>2", "3"…
+function dedupeNames(rawNames, joiner) {
+  const used = new Set();
+  return rawNames.map((raw) => {
+    const base = raw || "color";
+    if (!used.has(base)) { used.add(base); return base; }
+    let n = 2;
+    while (used.has(`${base}${joiner}${n}`)) n += 1;
+    const name = `${base}${joiner}${n}`;
+    used.add(name);
+    return name;
+  });
+}
+
+// Human-readable, de-duplicated swatch names for the Adobe (.aco/.ase) exports.
+function acoExportNames() {
+  return dedupeNames(state.swatches.map(acoSwatchName), " ");
+}
+
 function buildHarmonyPalette() {
+  const names = dedupeNames(
+    state.swatches.map((swatch) => sanitizeName(swatch.swatchName || swatch.objectName || swatch.colorName || "color")),
+    "_"
+  );
   const lines = ["ToonBoomAnimationInc PaletteFile 2"];
-  for (const swatch of state.swatches) {
-    const name = sanitizeName(swatch.swatchName || swatch.objectName || swatch.colorName || "color");
+  state.swatches.forEach((swatch, index) => {
     lines.push(
-      `Solid    ${name.padEnd(26, " ")} ${swatch.id} ${padColor(swatch.r)} ${padColor(swatch.g)} ${padColor(swatch.b)} ${padColor(swatch.a)}`
+      `Solid    ${names[index].padEnd(26, " ")} ${swatch.id} ${padColor(swatch.r)} ${padColor(swatch.g)} ${padColor(swatch.b)} ${padColor(swatch.a)}`
     );
-  }
+  });
   return `${lines.join("\n")}\n`;
 }
 
@@ -2432,16 +2455,17 @@ function buildAcoBytes() {
   push16(swatches.length);
   for (const swatch of swatches) writeColor(swatch);
 
-  // Version 2 block (adds names).
+  // Version 2 block (adds names; de-duplicated so no two swatches share a name).
+  const names = acoExportNames();
   push16(2);
   push16(swatches.length);
-  for (const swatch of swatches) {
+  swatches.forEach((swatch, index) => {
     writeColor(swatch);
-    const name = acoSwatchName(swatch);
+    const name = names[index];
     push32(name.length + 1); // character count, including the null terminator
     for (let i = 0; i < name.length; i += 1) push16(name.charCodeAt(i)); // UTF-16BE
     push16(0); // null terminator
-  }
+  });
 
   return new Uint8Array(bytes);
 }
@@ -2458,10 +2482,11 @@ function buildAcoPreview() {
     "Load in Photoshop: Swatches panel ▸ menu ▸ Load Swatches",
     ""
   ];
-  const nameWidth = Math.max(4, ...state.swatches.map((swatch) => acoSwatchName(swatch).length));
+  const names = acoExportNames();
+  const nameWidth = Math.max(4, ...names.map((name) => name.length));
   const rows = state.swatches.map((swatch, index) => {
     const num = String(index + 1).padStart(3, " ");
-    const name = acoSwatchName(swatch).padEnd(nameWidth, " ");
+    const name = names[index].padEnd(nameWidth, " ");
     const hex = rgbToHex(swatch.r, swatch.g, swatch.b).toUpperCase();
     return `${num}  ${name}  ${hex}  ${formatRgb(swatch)}`;
   });
@@ -2495,8 +2520,9 @@ function buildAseBytes() {
   u16(out, 0);
   u32(out, swatches.length);
 
-  for (const swatch of swatches) {
-    const name = acoSwatchName(swatch);
+  const names = acoExportNames();
+  swatches.forEach((swatch, index) => {
+    const name = names[index];
     const data = [];
     u16(data, name.length + 1); // name length in UTF-16 units, including null terminator
     for (let i = 0; i < name.length; i += 1) u16(data, name.charCodeAt(i)); // UTF-16BE
@@ -2510,7 +2536,7 @@ function buildAseBytes() {
     u16(out, 0x0001); // block type: color entry
     u32(out, data.length); // block length
     for (const byte of data) out.push(byte);
-  }
+  });
 
   return new Uint8Array(out);
 }
@@ -2523,10 +2549,11 @@ function buildAsePreview() {
     "Works across Photoshop, Illustrator & InDesign: Swatches ▸ menu ▸ Open/Load Swatch Library",
     ""
   ];
-  const nameWidth = Math.max(4, ...state.swatches.map((swatch) => acoSwatchName(swatch).length));
+  const names = acoExportNames();
+  const nameWidth = Math.max(4, ...names.map((name) => name.length));
   const rows = state.swatches.map((swatch, index) => {
     const num = String(index + 1).padStart(3, " ");
-    const name = acoSwatchName(swatch).padEnd(nameWidth, " ");
+    const name = names[index].padEnd(nameWidth, " ");
     const hex = rgbToHex(swatch.r, swatch.g, swatch.b).toUpperCase();
     return `${num}  ${name}  ${hex}  ${formatRgb(swatch)}`;
   });
