@@ -52,6 +52,8 @@ const els = {
   logClearBtn: document.querySelector("#logClearBtn")
 };
 
+let dragSrcIndex = -1;
+
 const state = {
   image: null,
   imageFileName: "",
@@ -690,6 +692,7 @@ function analyzeCurrentImage() {
     // set, the marker-based vision pass then refines the object names.
     buildSwatchesFromPixels(bundle);
     nameSwatchesHeuristically();
+    sortSwatchesByRole();
 
     renderSwatches();
     els.statusLine.textContent = `${state.swatches.length} colors captured from ${bundle.count.toLocaleString()} sampled pixels.`;
@@ -1215,6 +1218,19 @@ function nameSwatchesHeuristically() {
   assignTiers(swatches, stats, computeFamilies(swatches, stats));
 }
 
+// Line art / outlines always first, then fills, then background/sky last.
+function swatchRolePriority(swatch) {
+  const obj = swatch.objectName || "";
+  if (obj === "Line art") return 0;
+  if (obj === "Background" || obj === "Sky") return 2;
+  return 1;
+}
+
+function sortSwatchesByRole() {
+  // Stable sort: priority 0 → 1 → 2; order within each tier is preserved.
+  state.swatches.sort((a, b) => swatchRolePriority(a) - swatchRolePriority(b));
+}
+
 // Group swatches by family/material, sort each group by L* (light → dark), and
 // label highlight / midtone / shadow. The material identity comes from the label
 // (AI region or heuristic family), so members of one label ARE one material —
@@ -1335,6 +1351,7 @@ async function labelViaAi(token) {
 
     setAiProgress("Matching colors to regions…");
     const named = assignRegionsToSwatches(regions, picks);
+    sortSwatchesByRole();
     renderSwatches();
     refreshExportPreview();
     logLine(`Matched ${named} of ${picks.length} color pick${picks.length === 1 ? "" : "s"} to regions.`, "ai");
@@ -1750,6 +1767,39 @@ function renderSwatches() {
       recomputeCoverage(); // remaining colors absorb the removed color's pixels
       renderSwatches();
     });
+
+    // Drag-to-reorder: only activate draggable while the handle is pressed so
+    // clicks/selects inside the row still work normally.
+    const dragHandle = row.querySelector(".drag-handle");
+    if (dragHandle) {
+      dragHandle.addEventListener("mousedown", () => { row.draggable = true; });
+      dragHandle.addEventListener("mouseup", () => { row.draggable = false; });
+      row.addEventListener("dragstart", (e) => {
+        dragSrcIndex = index;
+        e.dataTransfer.effectAllowed = "move";
+        row.classList.add("dragging");
+      });
+      row.addEventListener("dragend", () => {
+        row.draggable = false;
+        row.classList.remove("dragging");
+      });
+      row.addEventListener("dragover", (e) => {
+        if (dragSrcIndex < 0) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        row.classList.add("drag-over");
+      });
+      row.addEventListener("dragleave", () => row.classList.remove("drag-over"));
+      row.addEventListener("drop", (e) => {
+        e.preventDefault();
+        row.classList.remove("drag-over");
+        if (dragSrcIndex < 0 || dragSrcIndex === index) return;
+        const moved = state.swatches.splice(dragSrcIndex, 1)[0];
+        state.swatches.splice(index, 0, moved);
+        dragSrcIndex = -1;
+        renderSwatches();
+      });
+    }
 
     els.swatchTable.appendChild(row);
   });
